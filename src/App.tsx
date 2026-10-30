@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Activity, Check, X } from 'lucide-react';
-import { AppDataSchema, BusinessRecord, GA4ReportData, GSCReportData, ResearchArticle } from './vite-env';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Activity, AlertTriangle, Check, X } from 'lucide-react';
+import { AppDataSchema, BusinessRecord, ResearchArticle, SyncAllResult, SyncResult } from './vite-env';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
 import { SampleBanner } from './components/SampleBanner';
@@ -12,14 +12,16 @@ import { InsightsPage } from './components/InsightsPage';
 import { StatusPage } from './components/StatusPage';
 import { SettingsModal } from './components/SettingsModal';
 import { SAMPLE_GA4_REPORT, SAMPLE_GSC_REPORT, SAMPLE_BUSINESS_RECORDS } from './sampleData';
+import { buildPatch, isEmptyPatch } from './utils/patch';
 
 const emptyInitialData: AppDataSchema = {
   version: 2,
   settings: {
     refreshMinutes: 30,
     syncOnStartup: true,
-    competitors: ['Microsoft', 'Adobe', 'Datadog', 'Mixpanel'],
+    competitors: [],
     aiModel: 'gpt-4o-mini',
+    reportDays: 30,
     theme: 'dark'
   },
   businessRecords: [],
@@ -38,87 +40,119 @@ const emptyInitialData: AppDataSchema = {
   lastRefresh: null
 };
 
+type SyncSourceName = 'ga4' | 'gsc' | 'research';
+
+const SOURCE_LABELS: Record<SyncSourceName, string> = {
+  ga4: 'Google Analytics 4',
+  gsc: 'Search Console',
+  research: 'Watchlist scan'
+};
+
+function describeSyncAll(res: SyncAllResult): { message: string; kind: 'success' | 'error' } {
+  const entries = (['ga4', 'gsc', 'research'] as const).map((key) => ({ key, result: res[key] }));
+  const failed = entries.filter((e) => !e.result.success && !e.result.skipped);
+  const skipped = entries.filter((e) => e.result.skipped);
+  const skippedNote = skipped.length ? ` Skipped: ${skipped.map((e) => SOURCE_LABELS[e.key]).join(', ')} (not configured).` : '';
+
+  if (failed.length === 0) {
+    return { message: `Synchronization complete.${skippedNote}`, kind: 'success' };
+  }
+  const details = failed.map((e) => `${SOURCE_LABELS[e.key]}: ${e.result.message}`).join(' · ');
+  return {
+    message: `${res.status === 'error' ? 'Synchronization failed' : 'Synchronization partially failed'}: ${details}${skippedNote}`,
+    kind: 'error'
+  };
+}
+
 export default function App() {
   const [page, setPage] = useState<string>('overview');
   const [data, setData] = useState<AppDataSchema>(emptyInitialData);
+  const dataRef = useRef<AppDataSchema>(emptyInitialData);
   const [isReady, setIsReady] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const [isSyncing, setIsSyncing] = useState(false);
+  // Sample mode is purely an in-memory overlay: demo data is never saved or sent anywhere.
   const [isSampleMode, setIsSampleMode] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [toastMessage, setToastMessage] = useState('');
+  const [toast, setToast] = useState<{ message: string; kind: 'success' | 'error' } | null>(null);
+  const toastTimer = useRef<number | undefined>(undefined);
 
-  // Sample data states for visual inspection without overwriting real store
-  const [sampleGa4, setSampleGa4] = useState<GA4ReportData | null>(null);
-  const [sampleGsc, setSampleGsc] = useState<GSCReportData | null>(null);
-
-  // Show Toast
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(''), 4500);
-  };
-
-  // Persist data updates to disk
-  const persistData = useCallback(async (next: AppDataSchema) => {
+  const applyData = useCallback((next: AppDataSchema) => {
+    dataRef.current = next;
     setData(next);
-    await window.orbit.write(next);
   }, []);
 
-  // Functional updater helper
-  const updateData = useCallback(
-    async (updater: (prev: AppDataSchema) => AppDataSchema) => {
-      setData((prev) => {
-        const next = updater(prev);
-        window.orbit.write(next).catch((err) => console.error('[App] Write failed:', err));
-        return next;
-      });
-    },
-    []
-  );
+  const showToast = useCallback((message: string, kind: 'success' | 'error' = 'success') => {
+    window.clearTimeout(toastTimer.current);
+    setToast({ message, kind });
+    toastTimer.current = window.setTimeout(() => setToast(null), kind === 'error' ? 8000 : 4500);
+  }, []);
 
-  // Initial Load
-  useEffect(() => {
+  const loadData = useCallback(() => {
+    setLoadError('');
+    let receivedPush = false;
+    // The main process pushes every change (background syncs, sign-in, imports), so the UI
+    // always reflects what's on disk instead of a stale snapshot.
+    const unsubscribe = window.orbit.onDataChanged((next) => {
+      receivedPush = true;
+      applyData(next);
+    });
     window.orbit
       .read()
       .then((loaded) => {
-        setData(loaded);
-        // If loaded records contain sample items, turn on sample mode toggle
-        if (loaded.businessRecords.some((r) => r.isSample)) {
-          setIsSampleMode(true);
-        }
+        if (!receivedPush) applyData(loaded);
         setIsReady(true);
       })
       .catch((err) => {
         console.error('[App] Failed to load data:', err);
-        setIsReady(true);
+        setLoadError(err?.message || 'Could not read the local Orbit database.');
       });
-  }, []);
+    return unsubscribe;
+  }, [applyData]);
+
+  useEffect(() => loadData(), [loadData]);
+
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+
+  // Applies a local edit and saves only the changed, renderer-owned fields.
+  // Resolves to false (after showing an error) if the change couldn't be saved.
+  const updateData = useCallback(
+    async (updater: (prev: AppDataSchema) => AppDataSchema): Promise<boolean> => {
+      const prev = dataRef.current;
+      const next = updater(prev);
+      const patch = buildPatch(prev, next);
+      if (isEmptyPatch(patch)) return true;
+
+      applyData(next);
+      try {
+        applyData(await window.orbit.patch(patch));
+        return true;
+      } catch (err: any) {
+        showToast(`Could not save changes: ${err?.message || 'Unknown error'}`, 'error');
+        try {
+          applyData(await window.orbit.read());
+        } catch {
+          applyData(prev);
+        }
+        return false;
+      }
+    },
+    [applyData, showToast]
+  );
 
   // Toggle Demo / Sample Mode
-  const handleToggleSampleMode = async () => {
+  const handleToggleSampleMode = () => {
     if (isSampleMode) {
-      // Clear sample data
-      setSampleGa4(null);
-      setSampleGsc(null);
-      const cleanedRecords = data.businessRecords.filter((r) => !r.isSample);
-      await persistData({
-        ...data,
-        businessRecords: cleanedRecords
-      });
       setIsSampleMode(false);
       showToast('Sample demonstration data cleared.');
     } else {
-      // Load sample data
-      setSampleGa4(SAMPLE_GA4_REPORT);
-      setSampleGsc(SAMPLE_GSC_REPORT);
-      const existingIds = new Set(data.businessRecords.map((r) => r.id));
-      const newSamples = SAMPLE_BUSINESS_RECORDS.filter((r) => !existingIds.has(r.id));
-      await persistData({
-        ...data,
-        businessRecords: [...newSamples, ...data.businessRecords]
-      });
       setIsSampleMode(true);
-      showToast('Sample demonstration data active. Marked as sample preview.');
+      showToast('Sample demonstration data shown. It is not saved and is never sent to the AI analyst.');
     }
+  };
+
+  const handleClearSampleData = () => {
+    if (isSampleMode) handleToggleSampleMode();
   };
 
   // Sync All
@@ -126,120 +160,125 @@ export default function App() {
     setIsSyncing(true);
     try {
       const res = await window.orbit.syncNow('all');
-      const refreshed = await window.orbit.read();
-      setData(refreshed);
-      showToast('All data sources synchronized successfully.');
+      const { message, kind } = describeSyncAll(res);
+      showToast(message, kind);
     } catch (err: any) {
-      showToast(`Synchronization error: ${err?.message || 'Check network connection'}`);
+      showToast(`Synchronization error: ${err?.message || 'Check network connection'}`, 'error');
     } finally {
       setIsSyncing(false);
     }
   };
 
   // Sync Individual Source
-  const handleSyncSource = async (source: 'ga4' | 'gsc' | 'research' | 'all') => {
-    setIsSyncing(true);
+  const syncSource = async (source: SyncSourceName): Promise<SyncResult> => {
     try {
-      await window.orbit.syncNow(source);
-      const refreshed = await window.orbit.read();
-      setData(refreshed);
-      showToast(`Source [${source.toUpperCase()}] synchronized.`);
+      const res = await window.orbit.syncNow(source);
+      if (res.success) showToast(`${SOURCE_LABELS[source]} synchronized.`);
+      else showToast(`${SOURCE_LABELS[source]}: ${res.message}`, 'error');
+      return res;
     } catch (err: any) {
-      showToast(`Sync error: ${err?.message || 'Failed'}`);
-    } finally {
-      setIsSyncing(false);
+      const message = err?.message || 'Failed';
+      showToast(`${SOURCE_LABELS[source]} sync error: ${message}`, 'error');
+      return { success: false, message };
     }
   };
 
-  // GA4 Manual Refresh
-  const handleRefreshGA4 = async () => {
-    const propId = data.settings.selectedGa4PropertyId || data.ga4Cache?.propertyId;
-    if (!propId) {
-      throw new Error('Please select an authorized GA4 property in Settings first.');
-    }
-    const report = await window.orbit.ga4GetReport(propId, 30);
-    setData((prev) => ({
-      ...prev,
-      ga4Cache: report,
-      sourcesHealth: {
-        ...prev.sourcesHealth,
-        ga4: { ...prev.sourcesHealth.ga4, lastSync: new Date().toISOString(), lastError: null }
-      }
-    }));
-    showToast('Google Analytics 4 report refreshed.');
+  const handleSyncSource = async (source: SyncSourceName | 'all') => {
+    if (source === 'all') return handleRefreshAll();
+    await syncSource(source);
   };
 
-  // GSC Manual Refresh
-  const handleRefreshGSC = async () => {
-    const siteUrl = data.settings.selectedGscSiteUrl || data.gscCache?.siteUrl;
-    if (!siteUrl) {
-      throw new Error('Please select a verified Search Console property first.');
+  const handleSelectGa4Property = async (propertyId: string) => {
+    if (await updateData((prev) => ({ ...prev, settings: { ...prev.settings, selectedGa4PropertyId: propertyId } }))) {
+      await syncSource('ga4');
     }
-    const report = await window.orbit.gscGetReport(siteUrl, 30);
-    setData((prev) => ({
-      ...prev,
-      gscCache: report,
-      sourcesHealth: {
-        ...prev.sourcesHealth,
-        gsc: { ...prev.sourcesHealth.gsc, lastSync: new Date().toISOString(), lastError: null }
-      }
-    }));
-    showToast('Google Search Console report refreshed.');
   };
 
-  // Public Research Search
-  const handlePerformSearch = async (q: string, category?: any) => {
-    const results = await window.orbit.publicResearch(q, category);
-    const refreshed = await window.orbit.read();
-    setData(refreshed);
-    return results;
+  const handleSelectGscSite = async (siteUrl: string) => {
+    if (await updateData((prev) => ({ ...prev, settings: { ...prev.settings, selectedGscSiteUrl: siteUrl } }))) {
+      await syncSource('gsc');
+    }
   };
+
+  const handleChangeReportDays = async (days: number) => {
+    if (!(await updateData((prev) => ({ ...prev, settings: { ...prev.settings, reportDays: days } })))) return;
+    const connected = dataRef.current.sourcesHealth.ga4.connected || dataRef.current.sourcesHealth.gsc.connected;
+    if (connected) {
+      await Promise.all([syncSource('ga4'), syncSource('gsc')]);
+    }
+  };
+
+  // Public Research Search (results are also pushed into app data by the main process)
+  const handlePerformSearch = (q: string, category?: string): Promise<ResearchArticle[]> =>
+    window.orbit.publicResearch(q, category);
 
   // Scan Watchlist
   const handleScanWatchlist = async () => {
     setIsSyncing(true);
     try {
-      await window.orbit.scanCompetitors();
-      const refreshed = await window.orbit.read();
-      setData(refreshed);
-      showToast(`Retrieved latest headlines for ${data.settings.competitors.length} competitors.`);
+      const res = await window.orbit.scanCompetitors();
+      showToast(res.message, res.success ? 'success' : 'error');
+    } catch (err: any) {
+      showToast(`Watchlist scan failed: ${err?.message || 'Unknown error'}`, 'error');
     } finally {
       setIsSyncing(false);
     }
   };
 
-  // Update Records
-  const handleUpdateRecords = async (records: BusinessRecord[]) => {
-    await persistData({
-      ...data,
-      businessRecords: records
-    });
-  };
+  // Update Records (sample rows are display-only and are filtered out before saving)
+  const handleUpdateRecords = (records: BusinessRecord[]) =>
+    updateData((prev) => ({ ...prev, businessRecords: records.filter((r) => !r.isSample) }));
 
   // Export Backup
   const handleExportBackup = async () => {
-    const jsonStr = await window.orbit.exportBackup();
-    const blob = new Blob([jsonStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `orbit-backup-${new Date().toISOString().slice(0, 10)}.json`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    showToast('Database backup exported.');
+    try {
+      const jsonStr = await window.orbit.exportBackup();
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `orbit-backup-${new Date().toISOString().slice(0, 10)}.json`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast('Database backup exported.');
+    } catch (err: any) {
+      showToast(`Backup export failed: ${err?.message || 'Unknown error'}`, 'error');
+    }
   };
 
   // Import Backup
   const handleImportBackup = async (jsonStr: string) => {
     const res = await window.orbit.importBackup(jsonStr);
     if (res.success) {
-      const refreshed = await window.orbit.read();
-      setData(refreshed);
-      showToast(`Backup restored! ${res.count} records loaded.`);
+      showToast(`Backup restored! ${res.count} new records added.`);
     }
     return res;
   };
+
+  // Ledger view with demo rows overlaid while sample mode is on
+  const viewData = useMemo<AppDataSchema>(
+    () =>
+      isSampleMode
+        ? { ...data, businessRecords: [...SAMPLE_BUSINESS_RECORDS, ...data.businessRecords] }
+        : data,
+    [data, isSampleMode]
+  );
+
+  if (loadError) {
+    return (
+      <div className="loading">
+        <div className="orbit-mark">
+          <AlertTriangle size={24} />
+        </div>
+        <span>Orbit could not load its local data: {loadError}</span>
+        <button className="primary-button" onClick={() => loadData()}>
+          Retry
+        </button>
+      </div>
+    );
+  }
 
   if (!isReady) {
     return (
@@ -253,8 +292,8 @@ export default function App() {
   }
 
   // Active GA4 and GSC datasets (either real cache or sample mode preview)
-  const activeGa4 = isSampleMode ? sampleGa4 || data.ga4Cache || SAMPLE_GA4_REPORT : data.ga4Cache;
-  const activeGsc = isSampleMode ? sampleGsc || data.gscCache || SAMPLE_GSC_REPORT : data.gscCache;
+  const activeGa4 = isSampleMode ? SAMPLE_GA4_REPORT : data.ga4Cache;
+  const activeGsc = isSampleMode ? SAMPLE_GSC_REPORT : data.gscCache;
 
   const pageTitles: Record<string, string> = {
     overview: 'Executive Dashboard',
@@ -272,7 +311,7 @@ export default function App() {
         activePage={page}
         onSelectPage={setPage}
         onOpenSettings={() => setShowSettings(true)}
-        data={data}
+        data={viewData}
         isSampleMode={isSampleMode}
       />
 
@@ -290,11 +329,11 @@ export default function App() {
 
         <div className="content">
           {/* Toast Notification */}
-          {toastMessage && (
-            <div className="toast">
-              <Check size={15} />
-              <span>{toastMessage}</span>
-              <button onClick={() => setToastMessage('')}>
+          {toast && (
+            <div className={`toast ${toast.kind === 'error' ? 'error-toast' : ''}`} role="status">
+              {toast.kind === 'error' ? <AlertTriangle size={15} /> : <Check size={15} />}
+              <span>{toast.message}</span>
+              <button onClick={() => setToast(null)} aria-label="Dismiss notification">
                 <X size={14} />
               </button>
             </div>
@@ -306,7 +345,7 @@ export default function App() {
           {/* Page Routing */}
           {page === 'overview' && (
             <OverviewPage
-              data={data}
+              data={viewData}
               ga4Data={activeGa4}
               gscData={activeGsc}
               onNavigate={setPage}
@@ -321,15 +360,19 @@ export default function App() {
               data={data}
               ga4Data={activeGa4}
               gscData={activeGsc}
+              isSampleMode={isSampleMode}
               onOpenSettings={() => setShowSettings(true)}
-              onRefreshGA4={handleRefreshGA4}
-              onRefreshGSC={handleRefreshGSC}
-              onLoadSample={handleToggleSampleMode}
+              onRefreshGA4={() => syncSource('ga4')}
+              onRefreshGSC={() => syncSource('gsc')}
+              onSelectGa4Property={handleSelectGa4Property}
+              onSelectGscSite={handleSelectGscSite}
+              onChangeReportDays={handleChangeReportDays}
+              onLoadSample={() => !isSampleMode && handleToggleSampleMode()}
             />
           )}
 
           {page === 'business' && (
-            <BusinessPage data={data} onUpdateRecords={handleUpdateRecords} />
+            <BusinessPage data={viewData} onUpdateRecords={handleUpdateRecords} />
           )}
 
           {page === 'research' && (
@@ -343,7 +386,7 @@ export default function App() {
           )}
 
           {page === 'insights' && (
-            <InsightsPage data={data} onOpenSettings={() => setShowSettings(true)} />
+            <InsightsPage data={data} isSampleMode={isSampleMode} onOpenSettings={() => setShowSettings(true)} />
           )}
 
           {page === 'status' && (
@@ -375,12 +418,13 @@ export default function App() {
       {showSettings && (
         <SettingsModal
           data={data}
+          isSampleMode={isSampleMode}
           onClose={() => setShowSettings(false)}
           onUpdateData={updateData}
           onExportBackup={handleExportBackup}
           onImportBackup={handleImportBackup}
           onClearSampleData={() => {
-            handleToggleSampleMode();
+            handleClearSampleData();
             setShowSettings(false);
           }}
         />

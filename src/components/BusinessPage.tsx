@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Plus,
   TrendingUp,
@@ -31,10 +31,12 @@ import { BusinessRecord, RecordKind, AppDataSchema } from '../vite-env';
 import { formatCurrency, formatDate } from '../utils/formatters';
 import { calculateLedgerMetrics, filterRecords, getRevenueExpensesTrend } from '../utils/calculations';
 import { exportRecordsToCsv, parseCsvToRecords } from '../utils/csv';
+import { localDateString } from '../utils/dates';
 
 interface BusinessPageProps {
   data: AppDataSchema;
-  onUpdateRecords: (records: BusinessRecord[]) => Promise<void>;
+  // Resolves to false if the change could not be saved (the error is already shown).
+  onUpdateRecords: (records: BusinessRecord[]) => Promise<boolean>;
 }
 
 export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecords }) => {
@@ -100,6 +102,11 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
 
   // Pagination
   const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+
+  // Deleting the last row on the last page (or a narrower filter) must not leave us on an empty page.
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
   const paginatedRecords = useMemo(() => {
     const start = (currentPage - 1) * pageSize;
     return filteredRecords.slice(start, start + pageSize);
@@ -110,7 +117,7 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
   // Open Add Modal
   const handleOpenAdd = () => {
     setEditingRecord(null);
-    setFormDate(new Date().toISOString().slice(0, 10));
+    setFormDate(localDateString());
     setFormLabel('');
     setFormKind('revenue');
     setFormAmount('');
@@ -140,6 +147,7 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
     const amount = formKind === 'lead' ? 0 : parseFloat(formAmount);
     if (formKind !== 'lead' && (!Number.isFinite(amount) || amount < 0)) return;
 
+    let saved: boolean;
     if (editingRecord) {
       // Update existing
       const updated = records.map((r) =>
@@ -155,36 +163,35 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
             }
           : r
       );
-      await onUpdateRecords(updated);
+      saved = await onUpdateRecords(updated);
     } else {
       // Create new
       const newRec: BusinessRecord = {
         id: crypto.randomUUID(),
-        date: formDate || new Date().toISOString().slice(0, 10),
+        date: formDate || localDateString(),
         label,
         kind: formKind,
         amount: amount || 0,
         category: formCategory.trim() || 'General',
-        notes: formNotes.trim(),
-        isSample: false
+        notes: formNotes.trim()
       };
-      await onUpdateRecords([newRec, ...records]);
+      saved = await onUpdateRecords([newRec, ...records]);
     }
 
-    setShowAddEditModal(false);
+    if (saved) setShowAddEditModal(false);
   };
 
   // Confirm Delete
   const handleConfirmDelete = async () => {
     if (!deletingRecord) return;
     const remaining = records.filter((r) => r.id !== deletingRecord.id);
-    await onUpdateRecords(remaining);
-    setDeletingRecord(null);
+    if (await onUpdateRecords(remaining)) setDeletingRecord(null);
   };
 
   // CSV Export
   const handleExportCsv = () => {
-    const csvContent = exportRecordsToCsv(filteredRecords);
+    // Demo rows are display-only; exporting them would turn them into real records on re-import.
+    const csvContent = exportRecordsToCsv(filteredRecords.filter((r) => !r.isSample));
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -193,26 +200,40 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   // CSV Import
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
+    // Reset so selecting the same file again still triggers onChange.
+    input.value = '';
     if (!file) return;
 
-    const text = await file.text();
+    setImportSuccessCount(null);
+    setImportErrors([]);
+
+    let text: string;
+    try {
+      text = await file.text();
+    } catch (err: any) {
+      setImportErrors([`Could not read file: ${err?.message || 'unknown error'}`]);
+      return;
+    }
+
     const { records: imported, errors } = parseCsvToRecords(text);
 
-    if (errors.length > 0 && imported.length === 0) {
-      setImportErrors(errors);
-      setImportSuccessCount(null);
+    if (imported.length === 0) {
+      setImportErrors(errors.length > 0 ? errors : ['No records found in this file.']);
       return;
     }
 
     const merged = [...imported, ...records];
-    await onUpdateRecords(merged);
-    setImportSuccessCount(imported.length);
-    setImportErrors(errors);
+    if (await onUpdateRecords(merged)) {
+      setImportSuccessCount(imported.length);
+      setImportErrors(errors);
+    }
   };
 
   return (
@@ -230,10 +251,21 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
         </div>
 
         <div className="section-actions">
-          <button className="outline-button" onClick={handleExportCsv} disabled={records.length === 0}>
+          <button
+            className="outline-button"
+            onClick={handleExportCsv}
+            disabled={!filteredRecords.some((r) => !r.isSample)}
+          >
             <Download size={14} /> Export CSV
           </button>
-          <button className="outline-button" onClick={() => setShowImportModal(true)}>
+          <button
+            className="outline-button"
+            onClick={() => {
+              setImportErrors([]);
+              setImportSuccessCount(null);
+              setShowImportModal(true);
+            }}
+          >
             <Upload size={14} /> Import CSV
           </button>
           <button className="primary-button" onClick={handleOpenAdd}>
@@ -354,7 +386,13 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
             }}
           />
           {searchTerm && (
-            <button className="clear-search" onClick={() => setSearchTerm('')}>
+            <button
+              className="clear-search"
+              onClick={() => {
+                setSearchTerm('');
+                setCurrentPage(1);
+              }}
+            >
               <X size={13} />
             </button>
           )}
@@ -490,20 +528,26 @@ export const BusinessPage: React.FC<BusinessPageProps> = ({ data, onUpdateRecord
                     </td>
                     <td className="record-notes">{r.notes || '—'}</td>
                     <td style={{ textAlign: 'right' }}>
-                      <button
-                        className="icon-action-btn"
-                        title="Edit record"
-                        onClick={() => handleOpenEdit(r)}
-                      >
-                        <Edit2 size={13} />
-                      </button>
-                      <button
-                        className="icon-action-btn delete"
-                        title="Delete record"
-                        onClick={() => setDeletingRecord(r)}
-                      >
-                        <Trash2 size={13} />
-                      </button>
+                      {r.isSample ? (
+                        <span className="record-notes" title="Sample rows are preview-only and can't be edited">—</span>
+                      ) : (
+                        <>
+                          <button
+                            className="icon-action-btn"
+                            title="Edit record"
+                            onClick={() => handleOpenEdit(r)}
+                          >
+                            <Edit2 size={13} />
+                          </button>
+                          <button
+                            className="icon-action-btn delete"
+                            title="Delete record"
+                            onClick={() => setDeletingRecord(r)}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </>
+                      )}
                     </td>
                   </tr>
                 ))}

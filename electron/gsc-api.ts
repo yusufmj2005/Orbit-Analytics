@@ -1,32 +1,34 @@
-import { GoogleOAuthManager } from './google-oauth';
+import type { TokenProvider } from './google-oauth';
 import { GSCReportData, GSCOverviewMetrics, GSCTrendPoint, GSCQueryRow, GSCPageRow } from './types';
+import { fetchWithTimeout, readApiError } from './http';
+import { daysAgoLocal, localDateString } from './dates';
+import { normalizeReportDays } from './ga4-api';
 
 export interface GSCSiteInfo {
   siteUrl: string;
   permissionLevel: string;
 }
 
-export class GSCService {
-  private oauth: GoogleOAuthManager;
+const round1 = (n: number) => Math.round(n * 10) / 10;
 
-  constructor(oauth: GoogleOAuthManager) {
+export class GSCService {
+  private oauth: TokenProvider;
+
+  constructor(oauth: TokenProvider) {
     this.oauth = oauth;
   }
 
   public async listSites(): Promise<GSCSiteInfo[]> {
     const accessToken = await this.oauth.getValidAccessToken();
 
-    const response = await fetch('https://www.googleapis.com/webmasters/v3/sites', {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      }
+    const response = await fetchWithTimeout('https://www.googleapis.com/webmasters/v3/sites', {
+      headers: { Authorization: `Bearer ${accessToken}` }
     });
 
     if (!response.ok) {
-      const err = await response.text();
-      console.error('[GSCService] Failed to list sites:', err);
-      throw new Error(`Google Search Console API error (${response.status}): ${err}`);
+      const err = await readApiError(response, 'Google Search Console API error');
+      console.error('[GSCService] Failed to list sites:', err.message);
+      throw err;
     }
 
     const data: any = await response.json();
@@ -34,7 +36,8 @@ export class GSCService {
 
     if (Array.isArray(data.siteEntry)) {
       for (const entry of data.siteEntry) {
-        if (entry.siteUrl) {
+        // Unverified sites can't be queried for search analytics.
+        if (entry.siteUrl && entry.permissionLevel !== 'siteUnverifiedUser') {
           sites.push({
             siteUrl: entry.siteUrl,
             permissionLevel: entry.permissionLevel || 'siteOwner'
@@ -47,22 +50,22 @@ export class GSCService {
   }
 
   public async getReport(siteUrl: string, days = 30): Promise<GSCReportData> {
-    const cleanUrl = siteUrl.trim();
+    const cleanUrl = String(siteUrl || '').trim();
     if (!cleanUrl) {
       throw new Error('Please select or specify a valid Search Console site URL.');
     }
+    const period = normalizeReportDays(days);
 
     const accessToken = await this.oauth.getValidAccessToken();
     const encodedSite = encodeURIComponent(cleanUrl);
     const endpoint = `https://www.googleapis.com/webmasters/v3/sites/${encodedSite}/searchAnalytics/query`;
 
-    const endDate = new Date().toISOString().slice(0, 10);
-    const startObj = new Date();
-    startObj.setDate(startObj.getDate() - days);
-    const startDate = startObj.toISOString().slice(0, 10);
+    // Inclusive range of exactly `period` calendar days in the user's timezone.
+    const endDate = localDateString();
+    const startDate = daysAgoLocal(period - 1);
 
     const runQuery = async (body: any) => {
-      const resp = await fetch(endpoint, {
+      const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -71,58 +74,18 @@ export class GSCService {
         body: JSON.stringify(body)
       });
       if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Search Console API error (${resp.status}): ${text}`);
+        throw await readApiError(resp, 'Search Console API error');
       }
-      return resp.json();
+      return resp.json() as Promise<any>;
     };
 
-    // 1. Fetch Daily Trends
-    const trendsPromise = runQuery({
-      startDate,
-      endDate,
-      dimensions: ['date'],
-      rowLimit: 100
-    });
-
-    // 2. Fetch Top Queries
-    const queriesPromise = runQuery({
-      startDate,
-      endDate,
-      dimensions: ['query'],
-      rowLimit: 15
-    });
-
-    // 3. Fetch Top Pages
-    const pagesPromise = runQuery({
-      startDate,
-      endDate,
-      dimensions: ['page'],
-      rowLimit: 15
-    });
-
-    // 4. Fetch Devices
-    const devicesPromise = runQuery({
-      startDate,
-      endDate,
-      dimensions: ['device'],
-      rowLimit: 10
-    });
-
-    // 5. Fetch Countries
-    const countriesPromise = runQuery({
-      startDate,
-      endDate,
-      dimensions: ['country'],
-      rowLimit: 10
-    });
-
+    const base = { startDate, endDate };
     const [trendsRes, queriesRes, pagesRes, devicesRes, countriesRes] = await Promise.all([
-      trendsPromise,
-      queriesPromise,
-      pagesPromise,
-      devicesPromise.catch(() => ({ rows: [] })),
-      countriesPromise.catch(() => ({ rows: [] }))
+      runQuery({ ...base, dimensions: ['date'], rowLimit: Math.max(100, period) }),
+      runQuery({ ...base, dimensions: ['query'], rowLimit: 15 }),
+      runQuery({ ...base, dimensions: ['page'], rowLimit: 15 }),
+      runQuery({ ...base, dimensions: ['device'], rowLimit: 10 }).catch(() => ({ rows: [] })),
+      runQuery({ ...base, dimensions: ['country'], rowLimit: 10 }).catch(() => ({ rows: [] }))
     ]);
 
     const dailyTrends: GSCTrendPoint[] = (trendsRes.rows || []).map((row: any) => ({
@@ -130,22 +93,26 @@ export class GSCService {
       clicks: Number(row.clicks) || 0,
       impressions: Number(row.impressions) || 0,
       ctr: Number(row.ctr) || 0,
-      position: Math.round((Number(row.position) || 0) * 10) / 10
+      position: round1(Number(row.position) || 0)
     }));
 
-    // Calculate aggregated overview metrics
-    const totalClicks = dailyTrends.reduce((s, p) => s + p.clicks, 0);
-    const totalImpressions = dailyTrends.reduce((s, p) => s + p.impressions, 0);
-    const overallCtr = totalImpressions > 0 ? totalClicks / totalImpressions : 0;
-    const avgPosition = dailyTrends.length > 0
-      ? Math.round((dailyTrends.reduce((s, p) => s + p.position, 0) / dailyTrends.length) * 10) / 10
-      : 0;
+    // Aggregate overview metrics. Average position is impression-weighted, matching how
+    // Search Console reports it; a plain mean over days over-weights low-traffic days.
+    let totalClicks = 0;
+    let totalImpressions = 0;
+    let weightedPosition = 0;
+    for (const row of trendsRes.rows || []) {
+      const impressions = Number(row.impressions) || 0;
+      totalClicks += Number(row.clicks) || 0;
+      totalImpressions += impressions;
+      weightedPosition += (Number(row.position) || 0) * impressions;
+    }
 
     const overview: GSCOverviewMetrics = {
       clicks: totalClicks,
       impressions: totalImpressions,
-      ctr: Math.min(1, Math.max(0, overallCtr)),
-      position: avgPosition
+      ctr: totalImpressions > 0 ? Math.min(1, totalClicks / totalImpressions) : 0,
+      position: totalImpressions > 0 ? round1(weightedPosition / totalImpressions) : 0
     };
 
     const topQueries: GSCQueryRow[] = (queriesRes.rows || []).map((row: any) => ({
@@ -153,7 +120,7 @@ export class GSCService {
       clicks: Number(row.clicks) || 0,
       impressions: Number(row.impressions) || 0,
       ctr: Number(row.ctr) || 0,
-      position: Math.round((Number(row.position) || 0) * 10) / 10
+      position: round1(Number(row.position) || 0)
     }));
 
     const topPages: GSCPageRow[] = (pagesRes.rows || []).map((row: any) => ({
@@ -161,7 +128,7 @@ export class GSCService {
       clicks: Number(row.clicks) || 0,
       impressions: Number(row.impressions) || 0,
       ctr: Number(row.ctr) || 0,
-      position: Math.round((Number(row.position) || 0) * 10) / 10
+      position: round1(Number(row.position) || 0)
     }));
 
     const deviceBreakdown = (devicesRes.rows || []).map((row: any) => ({
@@ -178,7 +145,8 @@ export class GSCService {
 
     return {
       siteUrl: cleanUrl,
-      dateRange: `Last ${days} days (${startDate} to ${endDate})`,
+      days: period,
+      dateRange: `Last ${period} days (${startDate} to ${endDate})`,
       fetchedAt: new Date().toISOString(),
       overview,
       dailyTrends,
@@ -189,4 +157,3 @@ export class GSCService {
     };
   }
 }
-

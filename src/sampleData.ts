@@ -1,8 +1,12 @@
 import { BusinessRecord, GA4ReportData, GSCReportData } from './vite-env';
+import { daysAgoLocal } from './utils/dates';
+
+// Demo data shown only in memory while sample mode is on; never saved or sent to the AI analyst.
 
 export const SAMPLE_GA4_REPORT: GA4ReportData = {
   propertyId: 'sample-98421032',
   propertyName: 'Acme SaaS Web App [SAMPLE DEMO]',
+  days: 30,
   dateRange: 'Last 30 days (Sample Preview)',
   fetchedAt: new Date().toISOString(),
   overview: {
@@ -48,6 +52,7 @@ export const SAMPLE_GA4_REPORT: GA4ReportData = {
 
 export const SAMPLE_GSC_REPORT: GSCReportData = {
   siteUrl: 'https://example-saas-orbit.com [SAMPLE DEMO]',
+  days: 30,
   dateRange: 'Last 30 days (Sample Preview)',
   fetchedAt: new Date().toISOString(),
   overview: {
@@ -96,7 +101,7 @@ export const SAMPLE_GSC_REPORT: GSCReportData = {
 export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   {
     id: 'sample-rec-1',
-    date: new Date(Date.now() - 1 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(1),
     label: 'Enterprise Annual License (Apex Corp)',
     kind: 'revenue',
     amount: 14500,
@@ -106,7 +111,7 @@ export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   },
   {
     id: 'sample-rec-2',
-    date: new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(2),
     label: 'AWS Cloud Hosting & Database Infrastructure',
     kind: 'expense',
     amount: 1850,
@@ -116,7 +121,7 @@ export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   },
   {
     id: 'sample-rec-3',
-    date: new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(3),
     label: 'Mid-Market Monthly SaaS Renewal (FinTech Ltd)',
     kind: 'revenue',
     amount: 2400,
@@ -126,7 +131,7 @@ export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   },
   {
     id: 'sample-rec-4',
-    date: new Date(Date.now() - 4 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(4),
     label: 'Inbound Demo Request - Series B SaaS Founder',
     kind: 'lead',
     amount: 0,
@@ -136,7 +141,7 @@ export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   },
   {
     id: 'sample-rec-5',
-    date: new Date(Date.now() - 5 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(5),
     label: 'Google Cloud API Quotas & Vertex AI Inference',
     kind: 'expense',
     amount: 620,
@@ -146,7 +151,7 @@ export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   },
   {
     id: 'sample-rec-6',
-    date: new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(7),
     label: 'Custom Dashboard Implementation Services',
     kind: 'revenue',
     amount: 4800,
@@ -156,7 +161,7 @@ export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   },
   {
     id: 'sample-rec-7',
-    date: new Date(Date.now() - 9 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(9),
     label: 'Developer Tooling & GitHub Enterprise Seats',
     kind: 'expense',
     amount: 450,
@@ -166,7 +171,7 @@ export const SAMPLE_BUSINESS_RECORDS: BusinessRecord[] = [
   },
   {
     id: 'sample-rec-8',
-    date: new Date(Date.now() - 11 * 86400000).toISOString().slice(0, 10),
+    date: daysAgoLocal(11),
     label: 'Inbound Enterprise Lead - Global Logistics Partner',
     kind: 'lead',
     amount: 0,

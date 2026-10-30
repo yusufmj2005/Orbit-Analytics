@@ -1,4 +1,5 @@
 import { BusinessRecord } from '../vite-env';
+import { daysAgoLocal, localDateString } from './dates';
 
 export interface LedgerSummary {
   revenue: number;
@@ -67,18 +68,17 @@ export function filterRecords(
   }
 
   if (options.dateRange && options.dateRange !== 'all') {
-    const now = new Date();
-    let cutoff = new Date();
+    // Compare local calendar dates; toISOString() would shift the cutoff by a day outside UTC.
+    let cutoffStr: string;
     if (options.dateRange === '7d') {
-      cutoff.setDate(now.getDate() - 7);
+      cutoffStr = daysAgoLocal(7);
     } else if (options.dateRange === '30d') {
-      cutoff.setDate(now.getDate() - 30);
+      cutoffStr = daysAgoLocal(30);
     } else if (options.dateRange === '90d') {
-      cutoff.setDate(now.getDate() - 90);
-    } else if (options.dateRange === 'this_year') {
-      cutoff = new Date(now.getFullYear(), 0, 1);
+      cutoffStr = daysAgoLocal(90);
+    } else {
+      cutoffStr = `${new Date().getFullYear()}-01-01`;
     }
-    const cutoffStr = cutoff.toISOString().slice(0, 10);
     filtered = filtered.filter((r) => r.date >= cutoffStr);
   }
 
@@ -92,9 +92,9 @@ export function getRevenueExpensesTrend(
   const result: { date: string; displayDate: string; revenue: number; expense: number; net: number }[] = [];
 
   for (let i = days - 1; i >= 0; i--) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    const dateStr = d.toISOString().slice(0, 10);
+    const now = new Date();
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+    const dateStr = localDateString(d);
     const displayDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 
     const dayRecords = records.filter((r) => r.date === dateStr);

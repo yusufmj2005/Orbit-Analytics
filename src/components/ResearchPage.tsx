@@ -19,8 +19,8 @@ import { ResearchArticle, AppDataSchema } from '../vite-env';
 
 interface ResearchPageProps {
   data: AppDataSchema;
-  onUpdateData: (updater: (prev: AppDataSchema) => AppDataSchema) => Promise<void>;
-  onPerformSearch: (query: string, category?: any) => Promise<ResearchArticle[]>;
+  onUpdateData: (updater: (prev: AppDataSchema) => AppDataSchema) => Promise<boolean>;
+  onPerformSearch: (query: string, category?: string) => Promise<ResearchArticle[]>;
   onScanWatchlist: () => Promise<void>;
   isScanning: boolean;
 }
@@ -36,8 +36,11 @@ export const ResearchPage: React.FC<ResearchPageProps> = ({
   const [category, setCategory] = useState<'general' | 'company' | 'competitor' | 'technology' | 'industry'>('general');
   const [isSearching, setIsSearching] = useState(false);
   const [searchError, setSearchError] = useState('');
-  const [articles, setArticles] = useState<ResearchArticle[]>(data.lastResearchResults || []);
+  // Results of the last search on this page; null shows the latest stored results (e.g. a
+  // watchlist scan that just finished, from here or in the background).
+  const [searchResults, setSearchResults] = useState<ResearchArticle[] | null>(null);
   const [newCompetitor, setNewCompetitor] = useState('');
+  const articles = searchResults ?? data.lastResearchResults ?? [];
 
   const competitors = data.settings.competitors || [];
   const searchHistory = data.searchHistory || [];
@@ -54,7 +57,7 @@ export const ResearchPage: React.FC<ResearchPageProps> = ({
 
     try {
       const results = await onPerformSearch(q, cat);
-      setArticles(results);
+      setSearchResults(results);
     } catch (err: any) {
       setSearchError(err?.message || 'Could not fetch public research feeds.');
     } finally {
@@ -66,11 +69,12 @@ export const ResearchPage: React.FC<ResearchPageProps> = ({
     if (!query.trim()) return;
     const exists = savedSearches.some((s) => s.query.toLowerCase() === query.trim().toLowerCase());
     if (exists) return;
+    const id = typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}`;
 
     await onUpdateData((prev) => ({
       ...prev,
       savedSearches: [
-        { id: crypto.randomUUID(), query: query.trim(), category },
+        { id, query: query.trim(), category },
         ...prev.savedSearches
       ]
     }));
@@ -93,16 +97,16 @@ export const ResearchPage: React.FC<ResearchPageProps> = ({
   const handleAddCompetitor = async (e: React.FormEvent) => {
     e.preventDefault();
     const name = newCompetitor.trim();
-    if (!name || competitors.includes(name)) return;
+    if (!name || competitors.some((c) => c.toLowerCase() === name.toLowerCase())) return;
 
-    await onUpdateData((prev) => ({
+    const saved = await onUpdateData((prev) => ({
       ...prev,
       settings: {
         ...prev.settings,
         competitors: [...prev.settings.competitors, name]
       }
     }));
-    setNewCompetitor('');
+    if (saved) setNewCompetitor('');
   };
 
   const handleRemoveCompetitor = async (name: string) => {
@@ -129,7 +133,14 @@ export const ResearchPage: React.FC<ResearchPageProps> = ({
           </p>
         </div>
 
-        <button className="primary-button" onClick={onScanWatchlist} disabled={isScanning || competitors.length === 0}>
+        <button
+          className="primary-button"
+          onClick={async () => {
+            await onScanWatchlist();
+            setSearchResults(null);
+          }}
+          disabled={isScanning || competitors.length === 0}
+        >
           <RefreshCw size={14} className={isScanning ? 'spin' : ''} />
           <span>{isScanning ? 'Scanning Watchlist...' : 'Scan All Competitors'}</span>
         </button>
@@ -250,7 +261,7 @@ export const ResearchPage: React.FC<ResearchPageProps> = ({
                 className="saved-search-pill"
                 onClick={() => {
                   setQuery(s.query);
-                  if (s.category) setCategory(s.category as any);
+                  if (s.category) setCategory(s.category as typeof category);
                   handleSearch(undefined, s.query, s.category);
                 }}
               >

@@ -29,7 +29,7 @@ export interface GA4OverviewMetrics {
   screenPageViews: number;
   engagementRate: number; // 0 to 1
   averageSessionDuration: number; // in seconds
-  conversions: number;
+  conversions: number; // GA4 "keyEvents" (formerly conversions)
 }
 
 export interface GA4TrendPoint {
@@ -56,6 +56,7 @@ export interface GA4LandingPageRow {
 export interface GA4ReportData {
   propertyId: string;
   propertyName?: string;
+  days?: number;
   dateRange: string;
   fetchedAt: string;
   overview: GA4OverviewMetrics;
@@ -97,6 +98,7 @@ export interface GSCPageRow {
 
 export interface GSCReportData {
   siteUrl: string;
+  days?: number;
   dateRange: string;
   fetchedAt: string;
   overview: GSCOverviewMetrics;
@@ -132,6 +134,7 @@ export interface AppSettings {
   aiModel: string;
   selectedGa4PropertyId?: string;
   selectedGscSiteUrl?: string;
+  reportDays: number; // 7, 30 or 90: period used for GA4 / Search Console reports
   theme: 'dark';
 }
 
@@ -154,3 +157,35 @@ export interface AppDataSchema {
   lastRefresh: string | null;
 }
 
+
+// Fields the renderer is allowed to change. Everything else (caches, sync history,
+// source health) is owned by the main process and never overwritten from the UI.
+export interface DataPatch {
+  businessRecords?: BusinessRecord[];
+  settings?: Partial<AppSettings>;
+  savedSearches?: AppDataSchema['savedSearches'];
+  searchHistory?: string[];
+}
+
+export type SyncSource = 'ga4' | 'gsc' | 'research';
+
+export interface SyncResult {
+  success: boolean;
+  message: string;
+  skipped?: boolean; // source not configured (e.g. Google not connected): not counted as a failure
+}
+
+export interface SyncAllResult {
+  status: 'success' | 'partial' | 'error';
+  ga4: SyncResult;
+  gsc: SyncResult;
+  research: SyncResult;
+}
+
+export interface AIAnalysisResponse {
+  answer: string;
+  modelUsed: string;
+  timestamp: string;
+  sourcesCited: string[];
+  dataSourcesIncluded: string[];
+}

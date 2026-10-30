@@ -26,16 +26,20 @@ import {
   YAxis,
   Tooltip
 } from 'recharts';
-import { GA4ReportData, GSCReportData, AppDataSchema } from '../vite-env';
+import { GA4ReportData, GSCReportData, AppDataSchema, SyncResult } from '../vite-env';
 import { formatNumber, formatPercent, formatDuration, formatRelativeTime } from '../utils/formatters';
 
 interface WebsitePageProps {
   data: AppDataSchema;
   ga4Data: GA4ReportData | null;
   gscData: GSCReportData | null;
+  isSampleMode: boolean;
   onOpenSettings: () => void;
-  onRefreshGA4: () => Promise<void>;
-  onRefreshGSC: () => Promise<void>;
+  onRefreshGA4: () => Promise<SyncResult>;
+  onRefreshGSC: () => Promise<SyncResult>;
+  onSelectGa4Property: (propertyId: string) => Promise<void>;
+  onSelectGscSite: (siteUrl: string) => Promise<void>;
+  onChangeReportDays: (days: number) => Promise<void>;
   onLoadSample: () => void;
 }
 
@@ -43,44 +47,80 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
   data,
   ga4Data,
   gscData,
+  isSampleMode,
   onOpenSettings,
   onRefreshGA4,
   onRefreshGSC,
+  onSelectGa4Property,
+  onSelectGscSite,
+  onChangeReportDays,
   onLoadSample
 }) => {
   const [activeTab, setActiveTab] = useState<'ga4' | 'gsc'>('ga4');
-  const [dateRange, setDateRange] = useState<number>(30);
   const [busyGA4, setBusyGA4] = useState(false);
   const [busyGSC, setBusyGSC] = useState(false);
   const [propertiesList, setPropertiesList] = useState<{ id: string; displayName: string; account: string }[]>([]);
   const [sitesList, setSitesList] = useState<{ siteUrl: string; permissionLevel: string }[]>([]);
+  const [listError, setListError] = useState('');
 
   const isGoogleConnected = data.sourcesHealth.ga4.connected || data.sourcesHealth.gsc.connected;
+  const reportDays = data.settings.reportDays || 30;
+  const ga4Error = !isSampleMode ? data.sourcesHealth.ga4.lastError : null;
+  const gscError = !isSampleMode ? data.sourcesHealth.gsc.lastError : null;
 
   useEffect(() => {
-    if (isGoogleConnected) {
-      window.orbit.ga4ListProperties().then(setPropertiesList).catch(() => {});
-      window.orbit.gscListSites().then(setSitesList).catch(() => {});
+    if (!isGoogleConnected) {
+      setPropertiesList([]);
+      setSitesList([]);
+      return;
     }
+    let active = true;
+    setListError('');
+    const fail = (err: any) => {
+      if (active) setListError(err?.message || 'Could not load your Google properties.');
+    };
+    window.orbit.ga4ListProperties().then((list) => active && setPropertiesList(list)).catch(fail);
+    window.orbit.gscListSites().then((list) => active && setSitesList(list)).catch(fail);
+    return () => {
+      active = false;
+    };
   }, [isGoogleConnected]);
 
-  const handleRefreshGA4 = async () => {
-    setBusyGA4(true);
+  const runBusy = async (setBusy: (busy: boolean) => void, task: () => Promise<unknown>) => {
+    setBusy(true);
     try {
-      await onRefreshGA4();
+      await task();
+    } catch (err) {
+      console.error('[WebsitePage] Refresh failed:', err);
     } finally {
-      setBusyGA4(false);
+      setBusy(false);
     }
   };
 
-  const handleRefreshGSC = async () => {
-    setBusyGSC(true);
-    try {
-      await onRefreshGSC();
-    } finally {
-      setBusyGSC(false);
-    }
-  };
+  const handleRefreshGA4 = () => runBusy(setBusyGA4, onRefreshGA4);
+  const handleRefreshGSC = () => runBusy(setBusyGSC, onRefreshGSC);
+
+  const handleChangeDays = (days: number) =>
+    runBusy(
+      (busy) => {
+        setBusyGA4(busy);
+        setBusyGSC(busy);
+      },
+      () => onChangeReportDays(days)
+    );
+
+  const periodSelect = (
+    <select
+      className="settings-input"
+      value={reportDays}
+      disabled={busyGA4 || busyGSC}
+      onChange={(e) => handleChangeDays(Number(e.target.value))}
+    >
+      <option value={7}>Last 7 days</option>
+      <option value={30}>Last 30 days</option>
+      <option value={90}>Last 90 days</option>
+    </select>
+  );
 
   return (
     <div className="website-page">
@@ -127,13 +167,13 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
                 <select
                   className="settings-input"
                   value={data.settings.selectedGa4PropertyId || ''}
+                  disabled={busyGA4}
                   onChange={(e) => {
-                    window.orbit.write({
-                      ...data,
-                      settings: { ...data.settings, selectedGa4PropertyId: e.target.value }
-                    });
+                    const id = e.target.value;
+                    if (id) runBusy(setBusyGA4, () => onSelectGa4Property(id));
                   }}
                 >
+                  {!data.settings.selectedGa4PropertyId && <option value="">Select a property...</option>}
                   {propertiesList.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.displayName} ({p.id})
@@ -149,15 +189,7 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
 
             <div className="control-group">
               <label>Period:</label>
-              <select
-                className="settings-input"
-                value={dateRange}
-                onChange={(e) => setDateRange(Number(e.target.value))}
-              >
-                <option value={7}>Last 7 days</option>
-                <option value={30}>Last 30 days</option>
-                <option value={90}>Last 90 days</option>
-              </select>
+              {periodSelect}
             </div>
 
             <div className="action-group">
@@ -174,6 +206,9 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
               </button>
             </div>
           </div>
+
+          {listError && <div className="error-box">{listError}</div>}
+          {ga4Error && <div className="error-box">Last GA4 sync failed: {ga4Error}</div>}
 
           {ga4Data ? (
             <>
@@ -217,13 +252,13 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
 
                 <div className="metric-card">
                   <div className="metric-top">
-                    <span>Conversions</span>
+                    <span>Key Events</span>
                     <CheckCircle2 size={16} />
                   </div>
                   <div className="metric-value">{ga4Data.overview.conversions.toLocaleString()}</div>
                   <div className="metric-note">
                     <span className="note-dot online" />
-                    <span>Key event actions</span>
+                    <span>Formerly called conversions in GA4</span>
                   </div>
                 </div>
               </div>
@@ -302,8 +337,8 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
                 <section className="panel">
                   <div className="panel-head">
                     <div>
-                      <h3>Top Landing Pages</h3>
-                      <p>Most frequented entry URLs.</p>
+                      <h3>Top Pages</h3>
+                      <p>Most viewed page paths.</p>
                     </div>
                   </div>
                   <div className="table-wrap">
@@ -336,7 +371,7 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
               <div className="empty-icon">
                 <Globe2 size={32} />
               </div>
-              <h3>Google Analytics 4 Not Connected</h3>
+              <h3>{isGoogleConnected ? 'No Google Analytics 4 Data Yet' : 'Google Analytics 4 Not Connected'}</h3>
               <p>
                 Connect your Google account in Settings to pull real session trends, user cohorts, conversion rates, and acquisition channels directly from the Google Analytics Data API.
               </p>
@@ -344,9 +379,11 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
                 <button className="primary-button" onClick={onOpenSettings}>
                   <Lock size={14} /> Connect Google Account
                 </button>
-                <button className="outline-button" onClick={onLoadSample}>
-                  Preview Sample GA4 Data
-                </button>
+                {!isSampleMode && (
+                  <button className="outline-button" onClick={onLoadSample}>
+                    Preview Sample GA4 Data
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -364,13 +401,13 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
                 <select
                   className="settings-input"
                   value={data.settings.selectedGscSiteUrl || ''}
+                  disabled={busyGSC}
                   onChange={(e) => {
-                    window.orbit.write({
-                      ...data,
-                      settings: { ...data.settings, selectedGscSiteUrl: e.target.value }
-                    });
+                    const url = e.target.value;
+                    if (url) runBusy(setBusyGSC, () => onSelectGscSite(url));
                   }}
                 >
+                  {!data.settings.selectedGscSiteUrl && <option value="">Select a site...</option>}
                   {sitesList.map((s) => (
                     <option key={s.siteUrl} value={s.siteUrl}>
                       {s.siteUrl}
@@ -386,15 +423,7 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
 
             <div className="control-group">
               <label>Period:</label>
-              <select
-                className="settings-input"
-                value={dateRange}
-                onChange={(e) => setDateRange(Number(e.target.value))}
-              >
-                <option value={7}>Last 7 days</option>
-                <option value={30}>Last 30 days</option>
-                <option value={90}>Last 90 days</option>
-              </select>
+              {periodSelect}
             </div>
 
             <div className="action-group">
@@ -411,6 +440,9 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
               </button>
             </div>
           </div>
+
+          {listError && <div className="error-box">{listError}</div>}
+          {gscError && <div className="error-box">Last Search Console sync failed: {gscError}</div>}
 
           {gscData ? (
             <>
@@ -570,7 +602,7 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
               <div className="empty-icon">
                 <Search size={32} />
               </div>
-              <h3>Google Search Console Not Connected</h3>
+              <h3>{isGoogleConnected ? 'No Search Console Data Yet' : 'Google Search Console Not Connected'}</h3>
               <p>
                 Connect your Google account to view search clicks, impression volume, average SERP ranking position, and the top keywords driving traffic to your domain.
               </p>
@@ -578,9 +610,11 @@ export const WebsitePage: React.FC<WebsitePageProps> = ({
                 <button className="primary-button" onClick={onOpenSettings}>
                   <Lock size={14} /> Connect Google Account
                 </button>
-                <button className="outline-button" onClick={onLoadSample}>
-                  Preview Sample Search Console Data
-                </button>
+                {!isSampleMode && (
+                  <button className="outline-button" onClick={onLoadSample}>
+                    Preview Sample Search Console Data
+                  </button>
+                )}
               </div>
             </div>
           )}

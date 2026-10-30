@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   BrainCircuit,
   Sparkles,
@@ -13,15 +13,22 @@ import {
   Send
 } from 'lucide-react';
 import { AppDataSchema, AIAnalysisResponse } from '../vite-env';
+import { MarkdownView } from './MarkdownView';
 
 interface InsightsPageProps {
   data: AppDataSchema;
+  isSampleMode: boolean;
   onOpenSettings: () => void;
 }
 
-export const InsightsPage: React.FC<InsightsPageProps> = ({ data, onOpenSettings }) => {
+export const InsightsPage: React.FC<InsightsPageProps> = ({ data, isSampleMode, onOpenSettings }) => {
   const [prompt, setPrompt] = useState('');
   const [selectedModel, setSelectedModel] = useState(data.settings.aiModel || 'gpt-4o-mini');
+
+  // Follow the default model when it's changed in Settings.
+  useEffect(() => {
+    setSelectedModel(data.settings.aiModel || 'gpt-4o-mini');
+  }, [data.settings.aiModel]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<AIAnalysisResponse | null>(null);
   const [analysisError, setAnalysisError] = useState('');
@@ -49,7 +56,7 @@ export const InsightsPage: React.FC<InsightsPageProps> = ({ data, onOpenSettings
 
   const handleRunAnalysis = async (customPrompt?: string) => {
     const q = (customPrompt !== undefined ? customPrompt : prompt).trim();
-    if (!q) return;
+    if (!q || isAnalyzing || !hasApiKey) return;
 
     setIsAnalyzing(true);
     setAnalysisError('');
@@ -125,6 +132,7 @@ export const InsightsPage: React.FC<InsightsPageProps> = ({ data, onOpenSettings
                     key={idx}
                     type="button"
                     className="quick-prompt-chip"
+                    disabled={isAnalyzing || !hasApiKey}
                     onClick={() => {
                       setPrompt(item.query);
                       handleRunAnalysis(item.query);
@@ -199,9 +207,7 @@ export const InsightsPage: React.FC<InsightsPageProps> = ({ data, onOpenSettings
                 </div>
               )}
 
-              <div className="ai-rendered-output">
-                {analysisResult.answer}
-              </div>
+              <MarkdownView text={analysisResult.answer} />
             </section>
           )}
 
@@ -226,24 +232,30 @@ export const InsightsPage: React.FC<InsightsPageProps> = ({ data, onOpenSettings
           <section className="panel context-panel">
             <h3>Context Transmitted to AI</h3>
             <p className="context-desc">
-              Only verified records and metadata are supplied. Secrets and system directories are never included.
+              Ledger totals, your 20 most recent records, cached GA4 / Search Console summaries and up to 8 headlines are sent to OpenAI. Secrets and system directories are never included.
             </p>
 
             <div className="context-row">
               <span>Business Ledger:</span>
               <strong>{data.businessRecords.length} records</strong>
             </div>
+            {isSampleMode && (
+              <div className="context-row">
+                <span>Sample / demo data:</span>
+                <strong>Never sent</strong>
+              </div>
+            )}
             <div className="context-row">
               <span>Google Analytics 4:</span>
-              <strong>{data.ga4Cache ? `${data.ga4Cache.overview.sessions.toLocaleString()} sessions` : 'Not Connected'}</strong>
+              <strong>{data.ga4Cache ? `${data.ga4Cache.overview.sessions.toLocaleString()} sessions` : data.sourcesHealth.ga4.connected ? 'No data synced' : 'Not Connected'}</strong>
             </div>
             <div className="context-row">
               <span>Search Console:</span>
-              <strong>{data.gscCache ? `${data.gscCache.overview.clicks.toLocaleString()} clicks` : 'Not Connected'}</strong>
+              <strong>{data.gscCache ? `${data.gscCache.overview.clicks.toLocaleString()} clicks` : data.sourcesHealth.gsc.connected ? 'No data synced' : 'Not Connected'}</strong>
             </div>
             <div className="context-row">
               <span>Research Headlines:</span>
-              <strong>{data.lastResearchResults.length} articles</strong>
+              <strong>{Math.min(data.lastResearchResults.length, 8)} articles</strong>
             </div>
             <div className="context-row">
               <span>Watchlist Competitors:</span>

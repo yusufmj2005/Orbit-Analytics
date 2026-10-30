@@ -1,8 +1,11 @@
+import { parseLocalDate } from './dates';
+
 export function formatCurrency(amount: number, currency = 'USD'): string {
   try {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency,
+      minimumFractionDigits: 0,
       maximumFractionDigits: 0
     }).format(amount);
   } catch {
@@ -12,19 +15,20 @@ export function formatCurrency(amount: number, currency = 'USD'): string {
 
 export function formatNumber(val: number): string {
   if (!Number.isFinite(val)) return '0';
-  if (val >= 1_000_000) {
+  const abs = Math.abs(val);
+  if (abs >= 1_000_000) {
     return (val / 1_000_000).toFixed(1) + 'M';
   }
-  if (val >= 1_000) {
+  if (abs >= 1_000) {
     return (val / 1_000).toFixed(1) + 'k';
   }
   return val.toLocaleString();
 }
 
+// Formats a ratio (0.25 → "25.0%"). Callers always pass ratios.
 export function formatPercent(ratio: number): string {
   if (!Number.isFinite(ratio)) return '0.0%';
-  const pct = ratio > 1 ? ratio : ratio * 100;
-  return `${pct.toFixed(1)}%`;
+  return `${(ratio * 100).toFixed(1)}%`;
 }
 
 export function formatDuration(seconds: number): string {
@@ -39,7 +43,7 @@ export function formatRelativeTime(dateStr: string | null | undefined): string {
   if (!dateStr) return 'Not synced yet';
   const time = new Date(dateStr).getTime();
   if (isNaN(time)) return 'Unknown';
-  const diffSec = Math.floor((Date.now() - time) / 1000);
+  const diffSec = Math.max(0, Math.floor((Date.now() - time) / 1000));
   if (diffSec < 10) return 'Just now';
   if (diffSec < 60) return `${diffSec}s ago`;
   const diffMin = Math.floor(diffSec / 60);
@@ -50,9 +54,11 @@ export function formatRelativeTime(dateStr: string | null | undefined): string {
   return `${diffDays}d ago`;
 }
 
+// Ledger dates are YYYY-MM-DD calendar dates. new Date('2026-10-05') would parse them as
+// UTC midnight and display the previous day west of UTC, so parse them as local dates.
 export function formatDate(dateStr: string): string {
   if (!dateStr) return '';
-  const d = new Date(dateStr);
+  const d = parseLocalDate(dateStr) ?? new Date(dateStr);
   if (isNaN(d.getTime())) return dateStr;
   return d.toLocaleDateString('en-US', {
     month: 'short',
@@ -60,4 +66,3 @@ export function formatDate(dateStr: string): string {
     year: 'numeric'
   });
 }
-

@@ -30,19 +30,19 @@ Orbit Analytics features seven primary views conforming to the Orbit reference d
 - **Visual Trend Area Chart**: 14-day daily financial activity visualizing revenue vs expenses.
 - **Source Health Glance**: Real-time status and sync timestamps for each integration.
 - **Market Signals Feed**: Recent competitor headlines fetched from public RSS news feeds.
-- **Demo Mode**: Explicitly tagged `[SAMPLE PREVIEW MODE]` allowing prospective users to preview charts and tables without fabricating live account connections.
+- **Demo Mode**: Explicitly tagged `[SAMPLE PREVIEW MODE]` allowing prospective users to preview charts and tables without fabricating live account connections. Sample data lives in memory only: it is never saved to disk, exported, or sent to the AI analyst.
 
 ### 2. Website Analytics (GA4 & Search Console)
 - **Google Analytics 4**:
   - Live ingestion from Google Analytics Data API (`analyticsdata.googleapis.com/v1beta`).
-  - Active Users, Total Users, Sessions, Screen Pageviews, Engagement Rate, Average Session Duration, and Conversions.
-  - Interactive AreaChart tracking daily session and user trends over 7, 30, or 90 days.
+  - Active Users, Total Users, Sessions, Screen Pageviews, Engagement Rate, Average Session Duration, and Key Events (formerly Conversions).
+  - Interactive AreaChart tracking daily session and user trends over 7, 30, or 90 days (the selected period is saved and used by background syncs too).
   - Traffic Acquisition Channels table (Organic Search, Direct, Referral, Paid, etc.).
-  - Top Landing Pages table with view counts and session metrics.
+  - Top Pages table with view counts and session metrics.
   - Property selector supporting multiple GA4 properties.
 - **Google Search Console**:
   - Live ingestion from Google Search Analytics API (`webmasters.v3`).
-  - Search Clicks, Search Impressions, Average CTR, and Average SERP Position.
+  - Search Clicks, Search Impressions, Average CTR, and impression-weighted Average SERP Position.
   - Search Visibility trend chart over customizable date intervals.
   - Top Search Queries keyword breakdown (clicks, impressions, CTR, position).
   - Top Performing Pages URL breakdown.
@@ -68,7 +68,7 @@ Orbit Analytics features seven primary views conforming to the Orbit reference d
 - **Article Reader**: Displays source badge, publication date, snippet, and launches original articles in the system default browser via sanitized IPC.
 
 ### 5. Orbit AI Analyst
-- **Privilege Separation**: Queries execute strictly within Electron's privileged process using the decrypted OpenAI API key. Credentials are never exposed to renderer logs or the UI.
+- **Privilege Separation**: Queries execute strictly within Electron's privileged process using the decrypted OpenAI API key. The IPC bridge can save, check or delete the key but never returns any decrypted secret to the UI.
 - **Strict Evidence-Based Reasoning**: Context dynamically includes the user's local ledger totals, GA4 metrics, Search Console signals, and competitor headlines with source timestamps.
 - **Honest Gap Disclosure**: Forbids hallucinated metrics. If GA4 or GSC is disconnected, the analyst explicitly states: *"Conversion cannot be calculated because Google Analytics 4 is not connected."*
 - **Source Citations**: Automatically attributes observations to `[Source: Local Ledger]`, `[Source: Google Analytics 4]`, or `[Source: Public RSS]`.
@@ -123,11 +123,11 @@ Orbit Analytics is engineered according to commercial desktop security standards
 └─────────────────────────────────────────────────────────────┘
 ```
 
-1. **Process Isolation**: Renderer runs with `contextIsolation: true`, `nodeIntegration: false`, and `sandbox: true`. No unrestricted filesystem or Node.js primitives are exposed to the UI.
+1. **Process Isolation**: Renderer runs with `contextIsolation: true`, `nodeIntegration: false`, and `sandbox: true`. No unrestricted filesystem or Node.js primitives are exposed to the UI. IPC handlers only accept calls from the app's own top-level frame, validate every argument, and the UI can only change its own fields (ledger, settings, saved searches) through a validated patch; sync results and connection state are owned by the main process and pushed to the UI on every change.
 2. **OS-Backed Credential Vault**: Secrets (OAuth tokens, refresh tokens, OpenAI keys) are encrypted using Electron's `safeStorage`, which leverages the Windows Data Protection API (DPAPI). Orbit refuses to fall back to plaintext.
 3. **PKCE & State Validation**: The Google OAuth desktop authorization flow uses cryptographic `code_verifier` / `code_challenge` (S256) and a 48-character random `state` token to prevent authorization code interception and CSRF.
-4. **Content Security Policy (CSP)**: Strict CSP in `index.html` restricts scripts, styles, fonts, and network connections.
-5. **Atomic Persistence**: Local JSON storage writes to temporary files first (`.tmp`) and safely renames to target, creating automatic `.bak` backups on every write cycle to guard against unexpected power loss or crashes.
+4. **Content Security Policy (CSP)**: Strict CSP in `index.html` restricts scripts, styles, fonts, and network connections. The dev-server allowances (inline React refresh preamble, HMR websocket) are added only by Vite in development and are not present in production builds.
+5. **Atomic Persistence**: Local JSON storage writes to temporary files first (`.tmp`) and safely renames to target, creating automatic `.bak` backups on every write cycle to guard against unexpected power loss or crashes. All updates are serialized through a single queue so concurrent writers never lose each other's changes; an unreadable data file is preserved as `orbit-data.corrupt-<timestamp>.json` before recovery from the backup.
 6. **Network Hygiene**: External links are validated to allow only `https://` or `http://` protocols and opened through the default OS browser. Certificate validation is never disabled.
 
 ---
@@ -196,7 +196,7 @@ npm install
 ```powershell
 npm test
 ```
-Executes all 21 automated unit tests across financial calculations, CSV parsing, atomic persistence, schema migration, OAuth PKCE, sync scheduler mutex, and AI context assembly.
+Executes the automated test suite across financial calculations, local-timezone date handling, CSV parsing, atomic and concurrent persistence, schema migration, OAuth PKCE, sync scheduling and retry, the GA4 / Search Console / news connectors, and AI context assembly.
 
 ### 3. Launch in Development Mode
 ```powershell
@@ -225,10 +225,12 @@ Produces the verified installation packages in the `release/` folder:
 Orbit includes a comprehensive test suite in `tests/`:
 
 - `tests/calculations.test.ts`: Validates ledger revenue, expense, net income, profit margin, date filtering (7d, 30d, 90d, this year), search filtering, daily trend grouping, and category breakdown proportions.
-- `tests/csv.test.ts`: Tests RFC 4180 CSV generation, quote escaping, multiline note handling, header variations, column auto-mapping, and corrupt input recovery.
-- `tests/store.test.ts`: Verifies atomic temp-file-and-rename writes, corrupt file recovery via automatic `.bak` fallback, v1 to v2 schema migrations, and sanitized JSON backup/restore.
-- `tests/oauth-and-sync.test.ts`: Tests S256 code challenge generation, random state verification, synchronization mutex locking (preventing overlapping duplicate jobs), and bounded exponential backoff calculations.
-- `tests/ai-context.test.ts`: Tests prompt context formatting, source citations parsing, secret isolation (ensuring API keys are never included in context), and explicit disclosure of missing data.
+- `tests/dates-and-patch.test.ts`: Verifies ledger dates, filters and charts use the local calendar day (tested west and east of UTC), and that UI edits are sent as minimal patches without sample records.
+- `tests/csv.test.ts`: Tests RFC 4180 CSV generation and parsing (including multi-line quoted notes), negative and accounting-style amounts, invalid input reporting, and spreadsheet formula-injection protection.
+- `tests/store.test.ts`: Verifies atomic writes, no lost updates under concurrent writers, corrupt file recovery that keeps the `.bak` intact, v1 to v2 migrations, patch validation, and sanitized JSON backup/restore.
+- `tests/sync-and-oauth.test.ts`: Tests PKCE S256 challenges, constant-time state checks, retry with bounded exponential backoff, and the real sync scheduler (deduplication, queued property changes, skipped vs. failed sources, startup sync).
+- `tests/connectors.test.ts`: Tests the GA4, Search Console and Google News connectors against mocked API responses.
+- `tests/ai-context.test.ts`: Tests the real AI context builder and OpenAI request: secret isolation, sample-data exclusion, citation parsing, model allowlist, and explicit disclosure of missing data.
 
 ---
 

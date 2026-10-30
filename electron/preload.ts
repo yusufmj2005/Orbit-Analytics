@@ -1,12 +1,20 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron';
 
 contextBridge.exposeInMainWorld('orbit', {
   read: () => ipcRenderer.invoke('orbit:read'),
-  write: (data: unknown) => ipcRenderer.invoke('orbit:write', data),
+  patch: (patch: unknown) => ipcRenderer.invoke('orbit:patch', patch),
+  onDataChanged: (callback: (data: unknown) => void) => {
+    const listener = (_event: IpcRendererEvent, data: unknown) => callback(data);
+    ipcRenderer.on('orbit:data-changed', listener);
+    return () => {
+      ipcRenderer.removeListener('orbit:data-changed', listener);
+    };
+  },
+
+  // Credentials (write/check only; secrets are never returned to the UI)
   storeSecret: (key: string, value: string) => ipcRenderer.invoke('orbit:store-secret', key, value),
   hasSecret: (key: string) => ipcRenderer.invoke('orbit:has-secret', key),
   deleteSecret: (key: string) => ipcRenderer.invoke('orbit:delete-secret', key),
-  getSecret: (key: string) => ipcRenderer.invoke('orbit:get-secret', key),
 
   // Google OAuth
   googleAuth: (clientId?: string, clientSecret?: string) =>
@@ -14,15 +22,9 @@ contextBridge.exposeInMainWorld('orbit', {
   googleDisconnect: () => ipcRenderer.invoke('orbit:google-disconnect'),
   googleStatus: () => ipcRenderer.invoke('orbit:google-status'),
 
-  // GA4
+  // GA4 / Search Console property pickers
   ga4ListProperties: () => ipcRenderer.invoke('orbit:ga4-list-properties'),
-  ga4GetReport: (propertyId: string, days?: number) =>
-    ipcRenderer.invoke('orbit:ga4-get-report', propertyId, days),
-
-  // GSC
   gscListSites: () => ipcRenderer.invoke('orbit:gsc-list-sites'),
-  gscGetReport: (siteUrl: string, days?: number) =>
-    ipcRenderer.invoke('orbit:gsc-get-report', siteUrl, days),
 
   // Public Research
   publicResearch: (query: string, category?: string) =>
@@ -36,8 +38,6 @@ contextBridge.exposeInMainWorld('orbit', {
   // Sync Scheduler
   syncNow: (source?: 'ga4' | 'gsc' | 'research' | 'all') =>
     ipcRenderer.invoke('orbit:sync-now', source),
-  syncUpdateSettings: (refreshMinutes: number, syncOnStartup: boolean) =>
-    ipcRenderer.invoke('orbit:sync-update-settings', refreshMinutes, syncOnStartup),
 
   // Backup / Restore
   exportBackup: () => ipcRenderer.invoke('orbit:export-backup'),

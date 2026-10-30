@@ -1,10 +1,12 @@
 import http from 'node:http';
-import crypto from 'node:crypto';
 import { shell } from 'electron';
 import { SecureCredentialVault } from './crypto';
+import { fetchWithTimeout, readApiError } from './http';
+import { generateCodeChallenge, generateCodeVerifier, generateState, statesMatch } from './pkce';
 
 const OAUTH_PORT = 8234;
 const REDIRECT_URI = `http://127.0.0.1:${OAUTH_PORT}/oauth2callback`;
+const SIGN_IN_TIMEOUT_MS = 180_000;
 
 const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/analytics.readonly',
@@ -19,34 +21,24 @@ export interface GoogleAuthTokens {
   email?: string;
 }
 
-export class GoogleOAuthManager {
+export interface TokenProvider {
+  getValidAccessToken(): Promise<string>;
+}
+
+interface PendingAuth {
+  server: http.Server;
+  timer: NodeJS.Timeout;
+  reject: (err: Error) => void;
+}
+
+export class GoogleOAuthManager implements TokenProvider {
   private vault: SecureCredentialVault;
-  private pendingAuth: {
-    server: http.Server | null;
-    state: string;
-    codeVerifier: string;
-    clientId: string;
-    clientSecret: string;
-    resolve: (tokens: GoogleAuthTokens) => void;
-    reject: (err: Error) => void;
-  } | null = null;
+  private pendingAuth: PendingAuth | null = null;
+  // Shared so GA4 and Search Console syncs starting together trigger a single refresh.
+  private refreshInFlight: Promise<string> | null = null;
 
   constructor(vault: SecureCredentialVault) {
     this.vault = vault;
-  }
-
-  // Base64URL encoding without padding
-  private base64UrlEncode(buffer: Buffer): string {
-    return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  }
-
-  private generateCodeVerifier(): string {
-    return this.base64UrlEncode(crypto.randomBytes(32));
-  }
-
-  private generateCodeChallenge(verifier: string): string {
-    const hash = crypto.createHash('sha256').update(verifier).digest();
-    return this.base64UrlEncode(hash);
   }
 
   public async getStoredTokens(): Promise<GoogleAuthTokens | null> {
@@ -72,7 +64,12 @@ export class GoogleOAuthManager {
       if (!tokens.refreshToken) {
         throw new Error('Google session expired and no refresh token is available. Please re-authenticate.');
       }
-      return this.refreshAccessToken(tokens.refreshToken);
+      if (!this.refreshInFlight) {
+        this.refreshInFlight = this.refreshAccessToken(tokens.refreshToken).finally(() => {
+          this.refreshInFlight = null;
+        });
+      }
+      return this.refreshInFlight;
     }
 
     return tokens.accessToken;
@@ -96,16 +93,22 @@ export class GoogleOAuthManager {
       bodyParams.append('client_secret', clientSecret);
     }
 
-    const response = await fetch('https://oauth2.googleapis.com/token', {
+    const response = await fetchWithTimeout('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: bodyParams.toString()
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      console.error('[GoogleOAuth] Token refresh failed:', errText);
-      throw new Error(`Google token refresh failed (HTTP ${response.status}). Authorization may have been revoked.`);
+      const err = await readApiError(response, 'Google token refresh failed');
+      console.error('[GoogleOAuth]', err.message);
+      if (response.status === 400 || response.status === 401) {
+        // invalid_grant: the refresh token was revoked or expired. Drop it so the app
+        // reports "not connected" instead of failing every sync.
+        await this.vault.deleteSecret('google_tokens');
+        throw new Error('Google authorization was revoked or has expired. Please sign in with Google again.');
+      }
+      throw err;
     }
 
     const data: any = await response.json();
@@ -123,32 +126,49 @@ export class GoogleOAuthManager {
   }
 
   public async startOAuthFlow(clientIdInput?: string, clientSecretInput?: string): Promise<GoogleAuthTokens> {
-    const clientId = clientIdInput?.trim() || (await this.vault.getSecret('google_client_id')) || '';
-    const clientSecret = clientSecretInput?.trim() || (await this.vault.getSecret('google_client_secret')) || '';
+    const storedClientId = (await this.vault.getSecret('google_client_id')) || '';
+    const clientId = clientIdInput?.trim() || storedClientId;
+    let clientSecret = clientSecretInput?.trim() || '';
 
     if (!clientId) {
       throw new Error('Please provide a Google OAuth Client ID before starting authentication.');
     }
 
-    // Save client credentials securely
+    if (!clientSecret && clientId === storedClientId) {
+      clientSecret = (await this.vault.getSecret('google_client_secret')) || '';
+    }
+
+    // Save client credentials securely. A new client ID without a secret must not keep
+    // the previous client's secret, or the token exchange fails with invalid_client.
     await this.vault.setSecret('google_client_id', clientId);
     if (clientSecret) {
       await this.vault.setSecret('google_client_secret', clientSecret);
+    } else {
+      await this.vault.deleteSecret('google_client_secret');
     }
 
-    // Cancel any previous pending auth
-    if (this.pendingAuth?.server) {
-      try {
-        this.pendingAuth.server.close();
-      } catch {}
-      this.pendingAuth = null;
-    }
+    // A newer sign-in attempt replaces any pending one; settle the old promise so its
+    // caller doesn't wait forever.
+    this.cancelPendingAuth(new Error('Sign-in was restarted.'));
 
-    const state = crypto.randomBytes(24).toString('hex');
-    const codeVerifier = this.generateCodeVerifier();
-    const codeChallenge = this.generateCodeChallenge(codeVerifier);
+    const state = generateState();
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = generateCodeChallenge(codeVerifier);
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (err: Error | null, tokens?: GoogleAuthTokens) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          server.close();
+        } catch {}
+        if (this.pendingAuth?.server === server) this.pendingAuth = null;
+        if (err) reject(err);
+        else resolve(tokens!);
+      };
+
       const server = http.createServer(async (req, res) => {
         try {
           const reqUrl = new URL(req.url || '/', `http://127.0.0.1:${OAUTH_PORT}`);
@@ -162,6 +182,14 @@ export class GoogleOAuthManager {
           const code = reqUrl.searchParams.get('code');
           const error = reqUrl.searchParams.get('error');
 
+          // Requests that don't carry our state (stray or forged) are refused but don't
+          // abort the sign-in the user is completing in their browser.
+          if (!statesMatch(state, queryState)) {
+            res.writeHead(400, { 'Content-Type': 'text/html' });
+            res.end('<h3>Invalid OAuth callback state. This request was ignored.</h3>');
+            return;
+          }
+
           if (error) {
             res.writeHead(400, { 'Content-Type': 'text/html' });
             res.end(`
@@ -171,18 +199,14 @@ export class GoogleOAuthManager {
                 <p>You can close this tab and return to Orbit Analytics.</p>
               </body></html>
             `);
-            server.close();
-            this.pendingAuth = null;
-            reject(new Error(`Google authorization was denied or failed: ${error}`));
+            finish(new Error(`Google authorization was denied or failed: ${error}`));
             return;
           }
 
-          if (queryState !== state || !code) {
+          if (!code) {
             res.writeHead(400, { 'Content-Type': 'text/html' });
-            res.end('<h3>Invalid OAuth callback state or missing authorization code.</h3>');
-            server.close();
-            this.pendingAuth = null;
-            reject(new Error('Invalid state received from OAuth callback. Request aborted for security.'));
+            res.end('<h3>Missing authorization code.</h3>');
+            finish(new Error('Google did not return an authorization code.'));
             return;
           }
 
@@ -198,15 +222,14 @@ export class GoogleOAuthManager {
             tokenParams.append('client_secret', clientSecret);
           }
 
-          const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+          const tokenResp = await fetchWithTimeout('https://oauth2.googleapis.com/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: tokenParams.toString()
           });
 
           if (!tokenResp.ok) {
-            const errBody = await tokenResp.text();
-            throw new Error(`Token exchange failed (HTTP ${tokenResp.status}): ${errBody}`);
+            throw await readApiError(tokenResp, 'Token exchange failed');
           }
 
           const tokenData: any = await tokenResp.json();
@@ -214,11 +237,11 @@ export class GoogleOAuthManager {
           // Fetch user profile to verify identity and test credentials
           let userEmail = '';
           try {
-            const userResp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+            const userResp = await fetchWithTimeout('https://www.googleapis.com/oauth2/v2/userinfo', {
               headers: { Authorization: `Bearer ${tokenData.access_token}` }
             });
             if (userResp.ok) {
-              const userInfo = await userResp.json();
+              const userInfo: any = await userResp.json();
               userEmail = userInfo.email || '';
             }
           } catch {}
@@ -232,12 +255,12 @@ export class GoogleOAuthManager {
 
           await this.vault.setSecret('google_tokens', JSON.stringify(tokens));
 
-          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(`
             <!DOCTYPE html><html>
             <body style="font-family:sans-serif;background:#090a12;color:#f2f1fb;display:flex;align-items:center;justify-content:center;height:90vh;margin:0;">
               <div style="background:#141522;border:1px solid #302b48;border-radius:14px;padding:36px;max-width:440px;text-align:center;">
-                <div style="width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#9477e9,#d09be7);display:grid;place-items:center;margin:0 auto 16px;color:#100d1e;font-weight:bold;font-size:24px;">✓</div>
+                <div style="width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#9477e9,#d09be7);display:grid;place-items:center;margin:0 auto 16px;color:#100d1e;font-weight:bold;font-size:24px;">&#10003;</div>
                 <h2 style="margin:0 0 8px;font-size:20px;">Orbit Analytics Connected!</h2>
                 <p style="color:#9a9cb4;font-size:13px;line-height:1.6;margin:0 0 20px;">Google account <strong>${escapeHtml(userEmail || 'Account')}</strong> was successfully authenticated.</p>
                 <p style="color:#777b94;font-size:11px;">You may safely close this browser window and return to the Orbit desktop application.</p>
@@ -245,16 +268,24 @@ export class GoogleOAuthManager {
             </body></html>
           `);
 
-          server.close();
-          this.pendingAuth = null;
-          resolve(tokens);
+          finish(null, tokens);
         } catch (err: any) {
-          res.writeHead(500, { 'Content-Type': 'text/html' });
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/html' });
+          }
           res.end(`<h3>Authentication error: ${escapeHtml(err?.message || 'Unknown')}</h3>`);
-          server.close();
-          this.pendingAuth = null;
-          reject(err);
+          finish(err instanceof Error ? err : new Error(String(err)));
         }
+      });
+
+      const timer = setTimeout(() => {
+        finish(new Error('Google sign-in timed out. Please try again.'));
+      }, SIGN_IN_TIMEOUT_MS);
+
+      this.pendingAuth = { server, timer, reject: (err) => finish(err) };
+
+      server.on('error', (err: any) => {
+        finish(new Error(`Failed to bind OAuth listener on port ${OAUTH_PORT}: ${err.message}`));
       });
 
       server.listen(OAUTH_PORT, '127.0.0.1', () => {
@@ -269,44 +300,38 @@ export class GoogleOAuthManager {
         authUrl.searchParams.set('access_type', 'offline');
         authUrl.searchParams.set('prompt', 'consent');
 
-        shell.openExternal(authUrl.toString());
-
-        this.pendingAuth = {
-          server,
-          state,
-          codeVerifier,
-          clientId,
-          clientSecret,
-          resolve,
-          reject
-        };
+        shell.openExternal(authUrl.toString()).catch((err) => {
+          finish(new Error(`Could not open the browser for Google sign-in: ${err?.message || err}`));
+        });
       });
-
-      server.on('error', (err: any) => {
-        this.pendingAuth = null;
-        reject(new Error(`Failed to bind OAuth listener on port ${OAUTH_PORT}: ${err.message}`));
-      });
-
-      // 3-minute timeout for user to complete sign-in
-      setTimeout(() => {
-        if (this.pendingAuth && this.pendingAuth.state === state) {
-          try {
-            server.close();
-          } catch {}
-          this.pendingAuth = null;
-          reject(new Error('Google sign-in timed out. Please try again.'));
-        }
-      }, 180_000);
     });
   }
 
+  private cancelPendingAuth(reason: Error): void {
+    const pending = this.pendingAuth;
+    this.pendingAuth = null;
+    pending?.reject(reason);
+  }
+
   public async disconnect(): Promise<void> {
-    const tokens = await this.getStoredTokens();
-    if (tokens?.accessToken) {
+    this.cancelPendingAuth(new Error('Google account was disconnected.'));
+    let tokens: GoogleAuthTokens | null = null;
+    try {
+      tokens = await this.getStoredTokens();
+    } catch {}
+    // Revoking the refresh token revokes the whole grant, including access tokens.
+    const token = tokens?.refreshToken || tokens?.accessToken;
+    if (token) {
       try {
-        await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(tokens.accessToken)}`, {
-          method: 'POST'
-        });
+        await fetchWithTimeout(
+          'https://oauth2.googleapis.com/revoke',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ token }).toString()
+          },
+          10_000
+        );
       } catch {
         // Continue even if network revocation fails
       }
@@ -315,17 +340,30 @@ export class GoogleOAuthManager {
   }
 
   public async isConnected(): Promise<boolean> {
-    const tokens = await this.getStoredTokens();
-    return Boolean(tokens?.accessToken);
+    try {
+      const tokens = await this.getStoredTokens();
+      return Boolean(tokens?.accessToken);
+    } catch (err: any) {
+      console.error('[GoogleOAuth] Could not read stored tokens:', err?.message || err);
+      return false;
+    }
   }
 
   public async getAccountEmail(): Promise<string | null> {
-    const tokens = await this.getStoredTokens();
-    return tokens?.email || null;
+    try {
+      const tokens = await this.getStoredTokens();
+      return tokens?.email || null;
+    } catch {
+      return null;
+    }
   }
 }
 
 function escapeHtml(str: string): string {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
-

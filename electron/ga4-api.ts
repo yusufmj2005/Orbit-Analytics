@@ -1,83 +1,95 @@
-import { GoogleOAuthManager } from './google-oauth';
+import type { TokenProvider } from './google-oauth';
 import { GA4ReportData, GA4OverviewMetrics, GA4TrendPoint, GA4ChannelRow, GA4LandingPageRow } from './types';
+import { fetchWithTimeout, readApiError } from './http';
 
 export interface GA4PropertyInfo {
-  id: string; // e.g. "properties/12345678" or "12345678"
+  id: string; // numeric property id, e.g. "12345678"
   displayName: string;
   account: string;
 }
 
-export class GA4Service {
-  private oauth: GoogleOAuthManager;
+export function normalizeReportDays(days: unknown): number {
+  const n = Math.round(Number(days));
+  return Number.isFinite(n) && n >= 1 && n <= 365 ? n : 30;
+}
 
-  constructor(oauth: GoogleOAuthManager) {
+export class GA4Service {
+  private oauth: TokenProvider;
+
+  constructor(oauth: TokenProvider) {
     this.oauth = oauth;
   }
 
   public async listProperties(): Promise<GA4PropertyInfo[]> {
     const accessToken = await this.oauth.getValidAccessToken();
-
-    const response = await fetch('https://analyticsadmin.googleapis.com/v1beta/accountSummaries', {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      console.error('[GA4Service] Failed to list account summaries:', err);
-      throw new Error(`Google Analytics Admin API error (${response.status}): ${err}`);
-    }
-
-    const data: any = await response.json();
     const properties: GA4PropertyInfo[] = [];
+    let pageToken = '';
 
-    if (Array.isArray(data.accountSummaries)) {
-      for (const account of data.accountSummaries) {
-        if (Array.isArray(account.propertySummaries)) {
-          for (const prop of account.propertySummaries) {
-            const rawId = prop.property || '';
-            const cleanId = rawId.replace(/^properties\//, '');
-            properties.push({
-              id: cleanId,
-              displayName: prop.displayName || `GA4 Property ${cleanId}`,
-              account: account.displayName || 'Google Analytics Account'
-            });
-          }
+    // accountSummaries is paginated; follow nextPageToken so large organizations see every property.
+    for (let page = 0; page < 50; page++) {
+      const url = new URL('https://analyticsadmin.googleapis.com/v1beta/accountSummaries');
+      url.searchParams.set('pageSize', '200');
+      if (pageToken) url.searchParams.set('pageToken', pageToken);
+
+      const response = await fetchWithTimeout(url.toString(), {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      if (!response.ok) {
+        const err = await readApiError(response, 'Google Analytics Admin API error');
+        console.error('[GA4Service] Failed to list account summaries:', err.message);
+        throw err;
+      }
+
+      const data: any = await response.json();
+      for (const account of Array.isArray(data.accountSummaries) ? data.accountSummaries : []) {
+        for (const prop of Array.isArray(account.propertySummaries) ? account.propertySummaries : []) {
+          const cleanId = String(prop.property || '').replace(/^properties\//, '');
+          if (!cleanId) continue;
+          properties.push({
+            id: cleanId,
+            displayName: prop.displayName || `GA4 Property ${cleanId}`,
+            account: account.displayName || 'Google Analytics Account'
+          });
         }
       }
+
+      pageToken = data.nextPageToken || '';
+      if (!pageToken) break;
     }
 
     return properties;
   }
 
   public async getReport(propertyId: string, days = 30): Promise<GA4ReportData> {
-    const cleanId = propertyId.replace(/^properties\//, '').trim();
-    if (!cleanId) {
-      throw new Error('Please specify a valid GA4 Property ID.');
+    const cleanId = String(propertyId || '').replace(/^properties\//, '').trim();
+    if (!/^\d+$/.test(cleanId)) {
+      throw new Error('Please specify a valid numeric GA4 Property ID.');
     }
+    const period = normalizeReportDays(days);
 
     const accessToken = await this.oauth.getValidAccessToken();
     const endpoint = `https://analyticsdata.googleapis.com/v1beta/properties/${cleanId}:runReport`;
+    // "NdaysAgo" through "today" is inclusive, so N-1 days ago gives exactly N days.
+    const dateRanges = [{ startDate: `${period - 1}daysAgo`, endDate: 'today' }];
 
     // 1. Fetch Overview & Metrics
     const overviewReq = {
-      dateRanges: [{ startDate: `${days}daysAgo`, endDate: 'today' }],
+      dateRanges,
       metrics: [
         { name: 'activeUsers' },
         { name: 'totalUsers' },
         { name: 'sessions' },
         { name: 'screenPageViews' },
         { name: 'engagementRate' },
-        { name: 'userEngagementDuration' },
-        { name: 'conversions' }
+        { name: 'averageSessionDuration' },
+        { name: 'keyEvents' }
       ]
     };
 
     // 2. Fetch Daily Trends
     const trendsReq = {
-      dateRanges: [{ startDate: `${days}daysAgo`, endDate: 'today' }],
+      dateRanges,
       dimensions: [{ name: 'date' }],
       metrics: [
         { name: 'activeUsers' },
@@ -89,7 +101,7 @@ export class GA4Service {
 
     // 3. Fetch Channels Breakdown
     const channelsReq = {
-      dateRanges: [{ startDate: `${days}daysAgo`, endDate: 'today' }],
+      dateRanges,
       dimensions: [{ name: 'sessionDefaultChannelGroup' }],
       metrics: [
         { name: 'sessions' },
@@ -100,9 +112,9 @@ export class GA4Service {
       limit: 8
     };
 
-    // 4. Fetch Top Landing Pages
+    // 4. Fetch Top Pages (pagePath + screenPageViews is a known-compatible combination)
     const pagesReq = {
-      dateRanges: [{ startDate: `${days}daysAgo`, endDate: 'today' }],
+      dateRanges,
       dimensions: [{ name: 'pagePath' }],
       metrics: [
         { name: 'screenPageViews' },
@@ -114,7 +126,7 @@ export class GA4Service {
     };
 
     const runReport = async (body: any) => {
-      const resp = await fetch(endpoint, {
+      const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -123,10 +135,9 @@ export class GA4Service {
         body: JSON.stringify(body)
       });
       if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`GA4 Data API error (${resp.status}): ${text}`);
+        throw await readApiError(resp, 'GA4 Data API error');
       }
-      return resp.json();
+      return resp.json() as Promise<any>;
     };
 
     const [overviewData, trendsData, channelsData, pagesData] = await Promise.all([
@@ -163,7 +174,7 @@ export class GA4Service {
       channel: row.dimensionValues?.[0]?.value || 'Unassigned',
       sessions: Number(row.metricValues?.[0]?.value) || 0,
       activeUsers: Number(row.metricValues?.[1]?.value) || 0,
-      engagementRate: Number(row.metricValues?.[2]?.value) || 0
+      engagementRate: Math.min(1, Math.max(0, Number(row.metricValues?.[2]?.value) || 0))
     }));
 
     const landingPages: GA4LandingPageRow[] = (pagesData.rows || []).map((row: any) => ({
@@ -175,7 +186,8 @@ export class GA4Service {
 
     return {
       propertyId: cleanId,
-      dateRange: `Last ${days} days`,
+      days: period,
+      dateRange: `Last ${period} days`,
       fetchedAt: new Date().toISOString(),
       overview,
       dailyTrends,
@@ -184,4 +196,3 @@ export class GA4Service {
     };
   }
 }
-

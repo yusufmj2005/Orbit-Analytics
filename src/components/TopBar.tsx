@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { RefreshCw, Settings2, Wifi, WifiOff, AlertTriangle, Play } from 'lucide-react';
 import { formatRelativeTime } from '../utils/formatters';
 
@@ -21,7 +21,17 @@ export const TopBar: React.FC<TopBarProps> = ({
   isSampleMode,
   onToggleSampleMode
 }) => {
-  const isOnline = navigator.onLine;
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+  useEffect(() => {
+    const update = () => setIsOnline(navigator.onLine);
+    window.addEventListener('online', update);
+    window.addEventListener('offline', update);
+    return () => {
+      window.removeEventListener('online', update);
+      window.removeEventListener('offline', update);
+    };
+  }, []);
 
   return (
     <header className="topbar">

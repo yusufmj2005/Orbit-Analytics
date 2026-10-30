@@ -916,3 +916,55 @@
   font-size: 9px;
   color: #7b7e98;
 }
+
+/* Error variant for toasts / notices */
+.toast.error-toast {
+  background: #281b24;
+  border-color: #693a47;
+  color: #f2b6c1;
+}
+.toast.error-toast button {
+  color: #f2b6c1;
+}
+
+/* Rendered AI analyst Markdown */
+.ai-rendered-output.markdown-body {
+  white-space: normal;
+}
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  font: 600 13px Manrope, sans-serif;
+  color: #e9e3ff;
+  margin: 18px 0 8px;
+}
+.markdown-body h3 {
+  font-size: 15px;
+}
+.markdown-body p {
+  margin: 0 0 10px;
+}
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+.markdown-body li {
+  margin-bottom: 4px;
+}
+.markdown-body code {
+  background: #1d1c2c;
+  border: 1px solid #2d2b43;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 11px;
+}
+.markdown-body hr {
+  border: 0;
+  border-top: 1px solid #252638;
+  margin: 16px 0;
+}
+.loading .primary-button {
+  margin-top: 6px;
+}

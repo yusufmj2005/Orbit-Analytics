@@ -129,7 +129,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
           <div className="metric-value">{formatCurrency(ledgerMetrics.revenue)}</div>
           <div className="metric-note">
             <span className="note-dot" />
-            <span>{hasRecords ? `${data.businessRecords.filter(r => r.kind === 'revenue').length} entries recorded` : 'Local ledger'}</span>
+            <span>{hasRecords ? `${data.businessRecords.filter((r) => r.kind === 'revenue').length} entries recorded` : 'Local ledger'}</span>
           </div>
         </div>
 
@@ -144,7 +144,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
           <div className="metric-value">{formatCurrency(ledgerMetrics.expenses)}</div>
           <div className="metric-note">
             <span className="note-dot" />
-            <span>{hasRecords ? `${data.businessRecords.filter(r => r.kind === 'expense').length} entries recorded` : 'Local ledger'}</span>
+            <span>{hasRecords ? `${data.businessRecords.filter((r) => r.kind === 'expense').length} entries recorded` : 'Local ledger'}</span>
           </div>
         </div>
 
@@ -168,7 +168,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
         {/* GA4 Sessions or Connection Prompt */}
         <div className="metric-card" onClick={() => onNavigate('website')} style={{ cursor: 'pointer' }}>
           <div className="metric-top">
-            <span>Website Sessions (30d)</span>
+            <span>Website Sessions{hasGA4 ? ` (${ga4Data!.days ?? 30}d)` : ''}</span>
             <div className="metric-icon">
               <Globe2 size={16} />
             </div>
@@ -185,7 +185,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
         {/* GSC Clicks or Connection Prompt */}
         <div className="metric-card" onClick={() => onNavigate('website')} style={{ cursor: 'pointer' }}>
           <div className="metric-top">
-            <span>Search Clicks (30d)</span>
+            <span>Search Clicks{hasGSC ? ` (${gscData!.days ?? 30}d)` : ''}</span>
             <div className="metric-icon">
               <Search size={16} />
             </div>
@@ -211,7 +211,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             {(data.sourcesHealth.ga4.connected ? 1 : 0) +
               (data.sourcesHealth.gsc.connected ? 1 : 0) +
               (data.sourcesHealth.ai.connected ? 1 : 0) +
-              1}{' '}
+              (data.sourcesHealth.research.status === 'error' ? 0 : 1)}{' '}
             / 4
           </div>
           <div className="metric-note">
@@ -340,7 +340,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                 <strong>Public Research Feed</strong>
                 <small>Google News RSS · {data.settings.competitors.length} watchlist targets</small>
               </div>
-              <span className="source-status text-success">Ready</span>
+              <span className={`source-status ${data.sourcesHealth.research.status === 'error' ? '' : 'text-success'}`}>
+                {data.sourcesHealth.research.status === 'error' ? 'Error' : 'Ready'}
+              </span>
             </div>
 
             <div className="source-row" onClick={() => onNavigate('insights')} style={{ cursor: 'pointer' }}>

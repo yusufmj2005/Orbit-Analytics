@@ -163,12 +163,14 @@ export const StatusPage: React.FC<StatusPageProps> = ({
             </div>
             <div>
               <h4>Public News RSS Feed</h4>
-              <span className="health-status-badge online">Active</span>
+              <span className={`health-status-badge ${data.sourcesHealth.research.status === 'error' ? 'offline' : 'online'}`}>
+                {data.sourcesHealth.research.status === 'error' ? 'Error' : 'Active'}
+              </span>
             </div>
             <button
               className="small-icon"
               title="Scan Watchlist"
-              disabled={syncingSource === 'research'}
+              disabled={syncingSource === 'research' || data.settings.competitors.length === 0}
               onClick={() => handleSync('research')}
             >
               <RefreshCw size={13} className={syncingSource === 'research' ? 'spin' : ''} />
@@ -304,7 +306,7 @@ export const StatusPage: React.FC<StatusPageProps> = ({
                       </span>
                     </td>
                     <td style={{ fontVariantNumeric: 'tabular-nums' }}>
-                      {log.durationMs > 0 ? `${log.durationMs}ms` : '< 1ms'}
+                      {log.durationMs >= 1000 ? `${(log.durationMs / 1000).toFixed(1)}s` : log.durationMs > 0 ? `${log.durationMs}ms` : '< 1ms'}
                     </td>
                     <td className="record-notes">{log.message}</td>
                   </tr>

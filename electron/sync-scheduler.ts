@@ -1,57 +1,60 @@
 import crypto from 'node:crypto';
-import { AppStore } from './store';
-import { GoogleOAuthManager } from './google-oauth';
-import { GA4Service } from './ga4-api';
-import { GSCService } from './gsc-api';
-import { ResearchService } from './research-api';
-import { SyncLogEntry } from './types';
+import type { AppStore } from './store';
+import type { GA4Service } from './ga4-api';
+import type { GSCService } from './gsc-api';
+import type { ResearchService } from './research-api';
+import { AppDataSchema, SourceHealth, SyncAllResult, SyncLogEntry, SyncResult, SyncSource } from './types';
+import { RetryOptions, withRetry } from './http';
+
+export interface ConnectionChecker {
+  isConnected(): Promise<boolean>;
+}
+
+type GA4Reporter = Pick<GA4Service, 'listProperties' | 'getReport'>;
+type GSCReporter = Pick<GSCService, 'listSites' | 'getReport'>;
+type CompetitorScanner = Pick<ResearchService, 'scanCompetitors'>;
+
+const STARTUP_SYNC_DELAY_MS = 3000;
 
 export class SyncScheduler {
-  private store: AppStore;
-  private oauth: GoogleOAuthManager;
-  private ga4Service: GA4Service;
-  private gscService: GSCService;
-  private researchService: ResearchService;
-
   private timer: NodeJS.Timeout | null = null;
-  private isSyncing = false;
-  private backoffDelays: Record<string, number> = { ga4: 1000, gsc: 1000, research: 1000 };
+  private startupTimer: NodeJS.Timeout | null = null;
+  // One job per source at a time. A request identical to the running one shares its
+  // promise; a request with different parameters (e.g. a newly selected property) is
+  // queued behind it so it never races the running job's cache writes.
+  private inFlight: Partial<Record<SyncSource, { key: string; promise: Promise<SyncResult> }>> = {};
+  private allInFlight: Promise<SyncAllResult> | null = null;
 
   constructor(
-    store: AppStore,
-    oauth: GoogleOAuthManager,
-    ga4Service: GA4Service,
-    gscService: GSCService,
-    researchService: ResearchService
-  ) {
-    this.store = store;
-    this.oauth = oauth;
-    this.ga4Service = ga4Service;
-    this.gscService = gscService;
-    this.researchService = researchService;
-  }
+    private store: AppStore,
+    private oauth: ConnectionChecker,
+    private ga4Service: GA4Reporter,
+    private gscService: GSCReporter,
+    private researchService: CompetitorScanner,
+    private retryOptions: RetryOptions = { attempts: 3, baseDelayMs: 1000, maxDelayMs: 60_000 }
+  ) {}
 
-  public async start(): Promise<void> {
+  // runStartupSync is only true on app launch; changing the interval must not re-trigger it.
+  public async start(options: { runStartupSync?: boolean } = {}): Promise<void> {
     this.stop();
     const data = await this.store.read();
     const minutes = data.settings.refreshMinutes;
 
-    if (data.settings.syncOnStartup) {
-      // Trigger startup sync shortly after boot
-      setTimeout(() => {
+    if (options.runStartupSync && data.settings.syncOnStartup) {
+      this.startupTimer = setTimeout(() => {
+        this.startupTimer = null;
         this.syncAll('Startup synchronization').catch((err) =>
           console.error('[SyncScheduler] Startup sync failed:', err)
         );
-      }, 3000);
+      }, STARTUP_SYNC_DELAY_MS);
     }
 
     if (minutes > 0) {
-      const ms = minutes * 60 * 1000;
       this.timer = setInterval(() => {
         this.syncAll('Scheduled background refresh').catch((err) =>
           console.error('[SyncScheduler] Scheduled sync error:', err)
         );
-      }, ms);
+      }, minutes * 60 * 1000);
     }
   }
 
@@ -59,6 +62,10 @@ export class SyncScheduler {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.startupTimer) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = null;
     }
   }
 
@@ -86,57 +93,81 @@ export class SyncScheduler {
     }));
   }
 
-  public async syncGA4(reason = 'Manual refresh'): Promise<{ success: boolean; message: string }> {
-    const startTime = Date.now();
-    const isGoogleConnected = await this.oauth.isConnected();
+  private runExclusive(source: SyncSource, key: string, job: () => Promise<SyncResult>): Promise<SyncResult> {
+    const existing = this.inFlight[source];
+    if (existing && existing.key === key) return existing.promise;
 
-    if (!isGoogleConnected) {
-      await this.store.update((prev) => ({
-        ...prev,
-        sourcesHealth: {
-          ...prev.sourcesHealth,
-          ga4: {
-            ...prev.sourcesHealth.ga4,
-            connected: false,
-            status: 'disconnected',
-            syncInProgress: false,
-            lastError: 'Google account not connected.'
-          }
-        }
-      }));
-      return { success: false, message: 'Google account is not connected.' };
-    }
+    const previous = existing?.promise ?? Promise.resolve();
+    const promise: Promise<SyncResult> = previous
+      .catch(() => undefined)
+      .then(job)
+      .finally(() => {
+        if (this.inFlight[source]?.promise === promise) delete this.inFlight[source];
+      });
+    this.inFlight[source] = { key, promise };
+    return promise;
+  }
 
-    const data = await this.store.read();
-    let propertyId = data.settings.selectedGa4PropertyId;
-
-    await this.store.update((prev) => ({
+  private setHealth(source: SyncSource, patch: Partial<SourceHealth>): Promise<AppDataSchema> {
+    return this.store.update((prev) => ({
       ...prev,
       sourcesHealth: {
         ...prev.sourcesHealth,
-        ga4: { ...prev.sourcesHealth.ga4, syncInProgress: true, status: 'syncing' }
+        [source]: { ...prev.sourcesHealth[source], ...patch }
       }
     }));
+  }
+
+  private async markDisconnected(source: 'ga4' | 'gsc'): Promise<SyncResult> {
+    await this.setHealth(source, {
+      connected: false,
+      status: 'disconnected',
+      syncInProgress: false,
+      lastError: null
+    });
+    return { success: false, skipped: true, message: 'Google account is not connected.' };
+  }
+
+  private async recordFailure(source: SyncSource, label: string, err: any, startTime: number): Promise<SyncResult> {
+    const errorMsg = err?.message || `${label} sync failed`;
+    await this.setHealth(source, { syncInProgress: false, status: 'error', lastError: errorMsg });
+    await this.logSync(source, 'error', `${label} sync failed: ${errorMsg}`, Date.now() - startTime);
+    return { success: false, message: errorMsg };
+  }
+
+  public async syncGA4(reason = 'Manual refresh'): Promise<SyncResult> {
+    const { settings } = await this.store.read();
+    return this.runExclusive('ga4', `${settings.selectedGa4PropertyId ?? ''}:${settings.reportDays}`, () =>
+      this.runGA4(reason)
+    );
+  }
+
+  private async runGA4(reason: string): Promise<SyncResult> {
+    const startTime = Date.now();
+    if (!(await this.oauth.isConnected())) return this.markDisconnected('ga4');
+
+    const { settings } = await this.store.read();
+    let propertyId = settings.selectedGa4PropertyId;
+    const days = settings.reportDays;
+
+    await this.setHealth('ga4', { connected: true, syncInProgress: true, status: 'syncing' });
 
     try {
       if (!propertyId) {
         // Try fetching first available property
-        const props = await this.ga4Service.listProperties();
-        if (props.length > 0) {
-          propertyId = props[0].id;
-          await this.store.update((prev) => ({
-            ...prev,
-            settings: { ...prev.settings, selectedGa4PropertyId: propertyId }
-          }));
-        } else {
+        const props = await withRetry(() => this.ga4Service.listProperties(), this.retryOptions);
+        if (props.length === 0) {
           throw new Error('No GA4 properties found in this Google account.');
         }
+        propertyId = props[0].id;
+        await this.store.update((prev) => ({
+          ...prev,
+          settings: { ...prev.settings, selectedGa4PropertyId: prev.settings.selectedGa4PropertyId || propertyId }
+        }));
       }
 
-      const report = await this.ga4Service.getReport(propertyId, 30);
-      const duration = Date.now() - startTime;
+      const report = await withRetry(() => this.ga4Service.getReport(propertyId!, days), this.retryOptions);
 
-      // Update cache without overwriting if report is null
       await this.store.update((prev) => ({
         ...prev,
         ga4Cache: report,
@@ -152,82 +183,49 @@ export class SyncScheduler {
         }
       }));
 
-      this.backoffDelays.ga4 = 1000; // Reset backoff
-      await this.logSync('ga4', 'success', `GA4 synced: ${report.overview.sessions} sessions recorded (${reason})`, duration);
+      await this.logSync(
+        'ga4',
+        'success',
+        `GA4 synced: ${report.overview.sessions} sessions over ${report.days ?? days} days (${reason})`,
+        Date.now() - startTime
+      );
       return { success: true, message: 'GA4 synchronized successfully.' };
     } catch (err: any) {
-      const duration = Date.now() - startTime;
-      const errorMsg = err?.message || 'GA4 sync failed';
-
-      // Exponential backoff adjustment
-      this.backoffDelays.ga4 = Math.min(this.backoffDelays.ga4 * 2, 60_000);
-
-      await this.store.update((prev) => ({
-        ...prev,
-        sourcesHealth: {
-          ...prev.sourcesHealth,
-          ga4: {
-            ...prev.sourcesHealth.ga4,
-            syncInProgress: false,
-            status: 'error',
-            lastError: errorMsg
-          }
-        }
-      }));
-
-      await this.logSync('ga4', 'error', `GA4 sync failed: ${errorMsg}`, duration);
-      return { success: false, message: errorMsg };
+      return this.recordFailure('ga4', 'GA4', err, startTime);
     }
   }
 
-  public async syncGSC(reason = 'Manual refresh'): Promise<{ success: boolean; message: string }> {
+  public async syncGSC(reason = 'Manual refresh'): Promise<SyncResult> {
+    const { settings } = await this.store.read();
+    return this.runExclusive('gsc', `${settings.selectedGscSiteUrl ?? ''}:${settings.reportDays}`, () =>
+      this.runGSC(reason)
+    );
+  }
+
+  private async runGSC(reason: string): Promise<SyncResult> {
     const startTime = Date.now();
-    const isGoogleConnected = await this.oauth.isConnected();
+    if (!(await this.oauth.isConnected())) return this.markDisconnected('gsc');
 
-    if (!isGoogleConnected) {
-      await this.store.update((prev) => ({
-        ...prev,
-        sourcesHealth: {
-          ...prev.sourcesHealth,
-          gsc: {
-            ...prev.sourcesHealth.gsc,
-            connected: false,
-            status: 'disconnected',
-            syncInProgress: false,
-            lastError: 'Google account not connected.'
-          }
-        }
-      }));
-      return { success: false, message: 'Google account is not connected.' };
-    }
+    const { settings } = await this.store.read();
+    let siteUrl = settings.selectedGscSiteUrl;
+    const days = settings.reportDays;
 
-    const data = await this.store.read();
-    let siteUrl = data.settings.selectedGscSiteUrl;
-
-    await this.store.update((prev) => ({
-      ...prev,
-      sourcesHealth: {
-        ...prev.sourcesHealth,
-        gsc: { ...prev.sourcesHealth.gsc, syncInProgress: true, status: 'syncing' }
-      }
-    }));
+    await this.setHealth('gsc', { connected: true, syncInProgress: true, status: 'syncing' });
 
     try {
       if (!siteUrl) {
-        const sites = await this.gscService.listSites();
-        if (sites.length > 0) {
-          siteUrl = sites[0].siteUrl;
-          await this.store.update((prev) => ({
-            ...prev,
-            settings: { ...prev.settings, selectedGscSiteUrl: siteUrl }
-          }));
-        } else {
+        const sites = await withRetry(() => this.gscService.listSites(), this.retryOptions);
+        if (sites.length === 0) {
           throw new Error('No verified Search Console properties found in this Google account.');
         }
+        siteUrl = sites[0].siteUrl;
+        await this.store.update((prev) => ({
+          ...prev,
+          settings: { ...prev.settings, selectedGscSiteUrl: prev.settings.selectedGscSiteUrl || siteUrl }
+        }));
       }
 
-      const report = await this.gscService.getReport(siteUrl, 30);
-      const duration = Date.now() - startTime;
+      const report = await withRetry(() => this.gscService.getReport(siteUrl!, days), this.retryOptions);
 
       await this.store.update((prev) => ({
         ...prev,
@@ -244,49 +242,36 @@ export class SyncScheduler {
         }
       }));
 
-      this.backoffDelays.gsc = 1000;
-      await this.logSync('gsc', 'success', `Search Console synced: ${report.overview.clicks} clicks recorded (${reason})`, duration);
+      await this.logSync(
+        'gsc',
+        'success',
+        `Search Console synced: ${report.overview.clicks} clicks over ${report.days ?? days} days (${reason})`,
+        Date.now() - startTime
+      );
       return { success: true, message: 'Search Console synchronized successfully.' };
     } catch (err: any) {
-      const duration = Date.now() - startTime;
-      const errorMsg = err?.message || 'Search Console sync failed';
-
-      this.backoffDelays.gsc = Math.min(this.backoffDelays.gsc * 2, 60_000);
-
-      await this.store.update((prev) => ({
-        ...prev,
-        sourcesHealth: {
-          ...prev.sourcesHealth,
-          gsc: {
-            ...prev.sourcesHealth.gsc,
-            syncInProgress: false,
-            status: 'error',
-            lastError: errorMsg
-          }
-        }
-      }));
-
-      await this.logSync('gsc', 'error', `Search Console sync failed: ${errorMsg}`, duration);
-      return { success: false, message: errorMsg };
+      return this.recordFailure('gsc', 'Search Console', err, startTime);
     }
   }
 
-  public async syncResearch(reason = 'Watchlist scan'): Promise<{ success: boolean; message: string }> {
-    const startTime = Date.now();
-    const data = await this.store.read();
-    const competitors = data.settings.competitors || [];
+  public async syncResearch(reason = 'Watchlist scan'): Promise<SyncResult> {
+    const { settings } = await this.store.read();
+    return this.runExclusive('research', settings.competitors.join('\u0000'), () => this.runResearch(reason));
+  }
 
-    await this.store.update((prev) => ({
-      ...prev,
-      sourcesHealth: {
-        ...prev.sourcesHealth,
-        research: { ...prev.sourcesHealth.research, syncInProgress: true, status: 'syncing' }
-      }
-    }));
+  private async runResearch(reason: string): Promise<SyncResult> {
+    const startTime = Date.now();
+    const { settings } = await this.store.read();
+    const competitors = settings.competitors || [];
+
+    if (competitors.length === 0) {
+      return { success: false, skipped: true, message: 'The competitor watchlist is empty.' };
+    }
+
+    await this.setHealth('research', { syncInProgress: true, status: 'syncing' });
 
     try {
-      const articles = await this.researchService.scanCompetitors(competitors);
-      const duration = Date.now() - startTime;
+      const articles = await withRetry(() => this.researchService.scanCompetitors(competitors), this.retryOptions);
 
       await this.store.update((prev) => ({
         ...prev,
@@ -303,66 +288,57 @@ export class SyncScheduler {
         }
       }));
 
-      this.backoffDelays.research = 1000;
-      await this.logSync('research', 'success', `Watchlist scanned: ${articles.length} headlines retrieved (${reason})`, duration);
-      return { success: true, message: `Retrieved ${articles.length} headlines.` };
+      await this.logSync(
+        'research',
+        'success',
+        `Watchlist scanned: ${articles.length} headlines retrieved for ${competitors.length} companies (${reason})`,
+        Date.now() - startTime
+      );
+      return { success: true, message: `Retrieved ${articles.length} headlines for ${competitors.length} companies.` };
     } catch (err: any) {
-      const duration = Date.now() - startTime;
-      const errorMsg = err?.message || 'Research feed fetch failed';
-
-      this.backoffDelays.research = Math.min(this.backoffDelays.research * 2, 60_000);
-
-      await this.store.update((prev) => ({
-        ...prev,
-        sourcesHealth: {
-          ...prev.sourcesHealth,
-          research: {
-            ...prev.sourcesHealth.research,
-            syncInProgress: false,
-            status: 'error',
-            lastError: errorMsg
-          }
-        }
-      }));
-
-      await this.logSync('research', 'error', `Watchlist scan failed: ${errorMsg}`, duration);
-      return { success: false, message: errorMsg };
+      return this.recordFailure('research', 'Watchlist scan', err, startTime);
     }
   }
 
-  public async syncAll(reason = 'Sync all'): Promise<{ ga4: any; gsc: any; research: any }> {
-    // Avoid overlapping runs
-    if (this.isSyncing) {
-      return {
-        ga4: { success: false, message: 'Sync already in progress.' },
-        gsc: { success: false, message: 'Sync already in progress.' },
-        research: { success: false, message: 'Sync already in progress.' }
-      };
-    }
-
-    this.isSyncing = true;
-    try {
-      const [ga4Res, gscRes, resRes] = await Promise.allSettled([
-        this.syncGA4(reason),
-        this.syncGSC(reason),
-        this.syncResearch(reason)
-      ]);
-
-      const ga4 = ga4Res.status === 'fulfilled' ? ga4Res.value : { success: false, message: ga4Res.reason };
-      const gsc = gscRes.status === 'fulfilled' ? gscRes.value : { success: false, message: gscRes.reason };
-      const research = resRes.status === 'fulfilled' ? resRes.value : { success: false, message: resRes.reason };
-
-      const overallStatus = (ga4.success || gsc.success) && research.success ? 'success' : 'partial';
-      await this.logSync('all', overallStatus, `Full sync completed: ${reason}`, 0, {
-        ga4: ga4.success,
-        gsc: gsc.success,
-        research: research.success
+  public syncAll(reason = 'Sync all'): Promise<SyncAllResult> {
+    // Overlapping "sync all" requests share the run that's already in progress.
+    if (!this.allInFlight) {
+      this.allInFlight = this.runAll(reason).finally(() => {
+        this.allInFlight = null;
       });
-
-      return { ga4, gsc, research };
-    } finally {
-      this.isSyncing = false;
     }
+    return this.allInFlight;
+  }
+
+  private async runAll(reason: string): Promise<SyncAllResult> {
+    const startTime = Date.now();
+    const settle = (r: PromiseSettledResult<SyncResult>): SyncResult =>
+      r.status === 'fulfilled' ? r.value : { success: false, message: String(r.reason?.message || r.reason) };
+
+    const [ga4Res, gscRes, researchRes] = await Promise.allSettled([
+      this.syncGA4(reason),
+      this.syncGSC(reason),
+      this.syncResearch(reason)
+    ]);
+    const ga4 = settle(ga4Res);
+    const gsc = settle(gscRes);
+    const research = settle(researchRes);
+
+    // Sources that aren't configured are skipped, not failures.
+    const attempted = [ga4, gsc, research].filter((r) => !r.skipped);
+    const failed = attempted.filter((r) => !r.success).length;
+    const status: SyncAllResult['status'] =
+      failed === 0 ? 'success' : failed === attempted.length ? 'error' : 'partial';
+
+    const describe = (name: string, r: SyncResult) => `${name} ${r.skipped ? 'skipped' : r.success ? 'ok' : 'failed'}`;
+    await this.logSync(
+      'all',
+      status,
+      `Full sync (${reason}): ${describe('GA4', ga4)}, ${describe('Search Console', gsc)}, ${describe('Research', research)}`,
+      Date.now() - startTime,
+      { ga4: ga4.success, gsc: gsc.success, research: research.success }
+    );
+
+    return { status, ga4, gsc, research };
   }
 }
-

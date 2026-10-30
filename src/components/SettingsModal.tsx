@@ -20,8 +20,9 @@ import { AppDataSchema } from '../vite-env';
 
 interface SettingsModalProps {
   data: AppDataSchema;
+  isSampleMode: boolean;
   onClose: () => void;
-  onUpdateData: (updater: (prev: AppDataSchema) => AppDataSchema) => Promise<void>;
+  onUpdateData: (updater: (prev: AppDataSchema) => AppDataSchema) => Promise<boolean>;
   onExportBackup: () => Promise<void>;
   onImportBackup: (jsonStr: string) => Promise<{ success: boolean; count: number; error?: string }>;
   onClearSampleData: () => void;
@@ -29,6 +30,7 @@ interface SettingsModalProps {
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   data,
+  isSampleMode,
   onClose,
   onUpdateData,
   onExportBackup,
@@ -59,16 +61,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   // Backup notice
   const [backupNotice, setBackupNotice] = useState('');
 
+  const refreshGoogleStatus = () => window.orbit.googleStatus().then(setGoogleStatus).catch(() => {});
+
+  // Re-check whenever the stored connection state changes (sign-in, revocation, disconnect).
   useEffect(() => {
-    window.orbit.googleStatus().then(setGoogleStatus).catch(() => {});
+    refreshGoogleStatus();
+  }, [data.sourcesHealth.ga4.connected, data.sourcesHealth.gsc.connected]);
+
+  useEffect(() => {
     window.orbit.hasSecret('openai_api_key').then(setHasAiKey).catch(() => {});
-  }, []);
+  }, [data.sourcesHealth.ai.connected]);
+
+  const flashNotice = (setter: (msg: string) => void, msg: string, ms: number) => {
+    setter(msg);
+    setTimeout(() => setter(''), ms);
+  };
 
   const handleStartGoogleAuth = async () => {
     setGoogleAuthBusy(true);
     setGoogleAuthError('');
     try {
-      const res = await window.orbit.googleAuth(googleClientId, googleClientSecret);
+      const res = await window.orbit.googleAuth(googleClientId.trim(), googleClientSecret.trim());
       setGoogleStatus({ connected: true, email: res.email || null, hasClientId: true });
       setGoogleClientId('');
       setGoogleClientSecret('');
@@ -80,8 +93,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleDisconnectGoogle = async () => {
-    await window.orbit.googleDisconnect();
-    setGoogleStatus({ connected: false, email: null, hasClientId: false });
+    setGoogleAuthError('');
+    try {
+      await window.orbit.googleDisconnect();
+    } catch (err: any) {
+      setGoogleAuthError(err?.message || 'Could not disconnect the Google account.');
+    }
+    // The client ID stays saved, so re-fetch rather than assuming it was cleared.
+    await refreshGoogleStatus();
   };
 
   const handleSaveAiKey = async () => {
@@ -90,31 +109,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       await window.orbit.storeSecret('openai_api_key', openAiKey.trim());
       setOpenAiKey('');
       setHasAiKey(true);
-      setAiKeyNotice('OpenAI key encrypted and saved via Windows DPAPI.');
-      setTimeout(() => setAiKeyNotice(''), 3500);
+      flashNotice(setAiKeyNotice, 'OpenAI key encrypted and saved via Windows DPAPI.', 3500);
     } catch (err: any) {
-      setAiKeyNotice(err?.message || 'Failed to save credential.');
+      flashNotice(setAiKeyNotice, err?.message || 'Failed to save credential.', 6000);
     }
   };
 
   const handleDeleteAiKey = async () => {
-    await window.orbit.deleteSecret('openai_api_key');
-    setHasAiKey(false);
-    setOpenAiKey('');
-    setAiKeyNotice('OpenAI key deleted.');
-    setTimeout(() => setAiKeyNotice(''), 3000);
+    try {
+      await window.orbit.deleteSecret('openai_api_key');
+      setHasAiKey(false);
+      setOpenAiKey('');
+      flashNotice(setAiKeyNotice, 'OpenAI key deleted.', 3000);
+    } catch (err: any) {
+      flashNotice(setAiKeyNotice, err?.message || 'Failed to delete credential.', 6000);
+    }
   };
 
   const handleAddCompetitor = async (e: React.FormEvent) => {
     e.preventDefault();
     const name = competitorInput.trim();
-    if (!name || data.settings.competitors.includes(name)) return;
+    if (!name || data.settings.competitors.some((c) => c.toLowerCase() === name.toLowerCase())) return;
 
-    await onUpdateData((prev) => ({
+    const saved = await onUpdateData((prev) => ({
       ...prev,
       settings: { ...prev.settings, competitors: [...prev.settings.competitors, name] }
     }));
-    setCompetitorInput('');
+    if (saved) setCompetitorInput('');
   };
 
   const handleRemoveCompetitor = async (name: string) => {
@@ -125,17 +146,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleImportBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
+    // Reset so choosing the same file again still triggers onChange.
+    input.value = '';
     if (!file) return;
 
-    const text = await file.text();
-    const res = await onImportBackup(text);
-    if (res.success) {
-      setBackupNotice(`Backup restored! ${res.count} records imported.`);
-    } else {
-      setBackupNotice(`Restore failed: ${res.error}`);
+    try {
+      const text = await file.text();
+      const res = await onImportBackup(text);
+      if (res.success) {
+        flashNotice(setBackupNotice, `Backup restored! ${res.count} new records added.`, 5000);
+      } else {
+        flashNotice(setBackupNotice, `Restore failed: ${res.error}`, 8000);
+      }
+    } catch (err: any) {
+      flashNotice(setBackupNotice, `Restore failed: ${err?.message || 'Could not read the file.'}`, 8000);
     }
-    setTimeout(() => setBackupNotice(''), 5000);
   };
 
   return (
@@ -236,7 +263,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     onChange={(e) => setGoogleClientId(e.target.value)}
                   />
 
-                  <label className="field-label">Client Secret (Optional for PKCE Desktop clients)</label>
+                  <label className="field-label">Client Secret</label>
                   <input
                     className="settings-input"
                     type="password"
@@ -341,10 +368,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <select
                   className="settings-input"
                   value={data.settings.refreshMinutes}
-                  onChange={async (e) => {
+                  onChange={(e) => {
                     const mins = Number(e.target.value);
-                    await window.orbit.syncUpdateSettings(mins, data.settings.syncOnStartup);
-                    await onUpdateData((prev) => ({
+                    // Saving the setting also reschedules the background timer in the main process.
+                    onUpdateData((prev) => ({
                       ...prev,
                       settings: { ...prev.settings, refreshMinutes: mins }
                     }));
@@ -364,10 +391,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   type="checkbox"
                   id="startupSync"
                   checked={data.settings.syncOnStartup}
-                  onChange={async (e) => {
+                  onChange={(e) => {
                     const checked = e.target.checked;
-                    await window.orbit.syncUpdateSettings(data.settings.refreshMinutes, checked);
-                    await onUpdateData((prev) => ({
+                    onUpdateData((prev) => ({
                       ...prev,
                       settings: { ...prev.settings, syncOnStartup: checked }
                     }));
@@ -448,12 +474,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                 </label>
 
-                <button className="outline-button" onClick={onClearSampleData}>
+                <button className="outline-button" onClick={onClearSampleData} disabled={!isSampleMode}>
                   Clear Demo / Sample Data
                 </button>
               </div>
 
-              {backupNotice && <div className="toast success-toast" style={{ marginTop: '16px' }}>{backupNotice}</div>}
+              {backupNotice && (
+                <div
+                  className={`toast ${backupNotice.startsWith('Restore failed') ? 'error-toast' : 'success-toast'}`}
+                  style={{ marginTop: '16px' }}
+                >
+                  {backupNotice}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -483,10 +516,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
                 <h5>3. External Transmission</h5>
                 <p>
-                  Network connections leave your PC only when you explicitly connect or refresh:
+                  Network connections leave your PC when you connect or refresh a source, and during the automatic background refresh you configure under Background Refresh:
                   <br />• <strong>Google APIs</strong>: Google Analytics Data API and Google Search Console APIs over HTTPS using authorized least-privilege read-only scopes.
                   <br />• <strong>Public RSS</strong>: Standard Google News RSS queries for public headlines.
-                  <br />• <strong>OpenAI API</strong>: Only when you execute an AI Analyst query; sends strictly curated ledger summaries and retrieved headlines without personal device telemetry.
+                  <br />• <strong>OpenAI API</strong>: Only when you execute an AI Analyst query; sends ledger totals, your 20 most recent ledger records, cached analytics summaries and up to 8 headlines, without device telemetry. Sample/demo data is never sent.
                 </p>
               </div>
             </div>
